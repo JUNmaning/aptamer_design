@@ -1,0 +1,41 @@
+run:
+  run_dir: runs/ce_run1_gbsa_smoke
+  seed: 123
+  log_level: INFO
+  workers: 4
+  resume: ture
+
+inputs:
+  ligand: data/ligand.sdf
+
+ce:
+  length: 30
+  alphabet: RNA
+  batch: 8
+  iters: 2
+  elite_frac: 0.25
+  alpha: 0.4
+  min_prob: 0.02
+  temperature: 1.0
+  topN: 20
+
+eval:
+  omp_threads: 1
+  simrna_iterations: 10000
+  simrna_frames: "1-3"
+  decoy_agg: "min"
+  vina_exhaustiveness: 4
+  vina_cpu: 1
+  grid_padding: 8.0
+
+  ligand_conformers: 5
+  ligand_seed: 123
+  ligand_prune_rmsd: 0.5
+  ligand_forcefield: "MMFF"
+  ligand_optimize: true
+  ligand_max_opt_iters: 200
+
+rescore:
+  enabled: true
+  topM: 5
+  include_penalty: false

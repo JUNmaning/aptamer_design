@@ -1,0 +1,23 @@
+
+# Windows downloaded-file metadata (WSL)
+*:Zone.Identifier
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local archives / packs
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Logs
+*.log
+leap.log
+
+# If these are generated/empty placeholders
+SKIP
+runs/
+runs/**

@@ -1,0 +1,6 @@
+integrator = md
+nsteps = 0
+dt = 0.001
+coulombtype = PME
+rcoulomb = 1.0
+rvdw = 1.0

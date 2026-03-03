@@ -1,0 +1,45 @@
+title = RNA aptamer MD (screening)
+; Run parameters
+integrator  = md        ; leap-frog integrator
+nsteps               = 2500000          ; 5 ns (2 fs timestep)
+dt          = 0.002     ; 2 fs
+; Output control
+nstxout             = 0         ; suppress .trr output 
+nstvout             = 0         ; suppress .trr output
+nstenergy            = 2500             ; save energies every 5 ps
+nstlog               = 2500             ; update log every 5 ps
+nstxout-compressed   = 2500             ; write xtc every 5 ps
+compressed-x-grps   = System
+; Bond parameters
+continuation    = yes           ; first dynamics run
+constraint_algorithm = lincs    ; holonomic constraints 
+constraints          = h-bonds          ; constrain bonds involving H (RNA)
+lincs_iter      = 1             ; accuracy of LINCS
+lincs_order     = 4             ; also related to accuracy
+; Neighborsearching
+cutoff-scheme   = Verlet
+ns_type         = grid      ; search neighboring grid cells
+nstlist         = 10        ; 20 fs, largely irrelevant with Verlet
+rcoulomb             = 1.0              ; electrostatic cutoff (nm)
+rvdw                 = 1.0              ; vdW cutoff (nm)
+; Electrostatics
+coulombtype     = PME       ; Particle Mesh Ewald for long-range electrostatics
+pme_order       = 4         ; cubic interpolation
+fourierspacing       = 0.12             ; PME grid spacing
+; Temperature coupling
+tcoupl      = V-rescale                     ; modified Berendsen thermostat
+tc-grps     = System
+tau_t       = 0.1                        ; time constant, in ps
+ref_t       = 300                        ; reference temperature, one for each group, in K
+; Pressure coupling 
+pcoupl               = Parrinello-Rahman ; production NPT
+pcoupltype  = isotropic                     ; uniform scaling of box vectors
+tau_p                = 2.0              ; barostat time constant
+ref_p       = 1.0                           ; reference pressure, in bar
+compressibility = 4.5e-5                    ; isothermal compressibility of water, bar^-1
+; Periodic boundary conditions
+pbc         = xyz       ; 3-D PBC
+; Dispersion correction
+DispCorr    = EnerPres  ; account for cut-off vdW scheme
+; Velocity generation
+gen_vel     = no        ; assign velocities from Maxwell distribution
