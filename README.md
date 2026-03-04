@@ -91,7 +91,7 @@ which vina || echo "vina not found"
 
 ---
 
-## 4) Configuration explained (example: `run_default.yaml`)
+## 4) Configuration explained (`run_default.yaml`)
 
 Example config:
 
@@ -247,7 +247,7 @@ Expected:
 
 ---
 
-## 6) How to analyze results (for reporting)
+## 6) How to analyze results 
 
 ### 6.1 Convergence trend: `history.csv`
 
@@ -295,7 +295,7 @@ print("frames_in_trafl =", n)
 PY
 ```
 
-### 6.4 Rescoring outputs (if enabled)
+### 6.4 Rescoring outputs 
 
 Per iteration:
 
@@ -402,7 +402,7 @@ This loop will:
 **Important:** if `ce.iters=30`, the loop performs MMGBSA+feedback for every iteration it successfully completes (1..30).  
 If you stop the loop manually and rerun later, it will continue from `checkpoint.json`.
 
-### 10.3 Restart / resume rules (what gets reused)
+### 10.3 Restart / resume rules 
 
 The pipeline is designed to be restartable:
 - `dist.json` = your CE distribution state
@@ -421,7 +421,7 @@ rm -rf runs/ce_run1
 
 There are two “views”:
 
-### 11.1 Vina (cheap, always available): `topN.csv`
+### 11.1 Vina (always available): `topN.csv`
 
 ```bash
 head -n 10 runs/ce_run1/topN.csv
@@ -432,7 +432,7 @@ Use this for:
 - sanity check (frames/conformers counted)
 - locate best pose PDBQT and best receptor PDB
 
-### 11.2 MMGBSA (expensive, rescoring): `rescore/iter_XXX/mmgbsa_results.csv`
+### 11.2 MMGBSA ( rescoring): `rescore/iter_XXX/mmgbsa_results.csv`
 
 Per iteration:
 ```bash
@@ -451,7 +451,7 @@ Recommended final selection strategy:
 
 ---
 
-## 12) Visualization (make the pipeline “visible”)
+## 12) Visualization
 
 ### 12.1 Plot convergence from `history.csv`
 
