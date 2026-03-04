@@ -1,4 +1,4 @@
-# Aptamer Design Pipeline (CE + Multi-frame SimRNA + Vina Docking + MMGBSA Feedback Loop)
+# Aptamer Design Pipeline (CE + Multi-frame SimRNA + Vina Docking + MMGBSA Feedback Loop + MD)
 
 Author: maning
 
@@ -47,6 +47,11 @@ runs/<RUN_NAME>/
 │   └── lig_YYY/                  # docking results per ligand conformer
 │       ├── *_dock.pdbqt
 │       ├── *.vina.log
+│       └── ...
+│ ── md/rank_00x_<eval_hash>/     # MD results per frame
+│   └── lig_YYY/                  
+│       ├── *_dock.pdbqt
+│       ├── *md.log
 │       └── ...
 └── rescore/iter_XXX/             # rescoring directory (if enabled)
     ├── manifest.jsonl            # topM jobs derived from topN.csv
@@ -156,6 +161,22 @@ rescore:
   enabled: true
   topM: 5
   include_penalty: false
+md:
+  enabled: true
+  topX: 10
+  gmx: gmx
+  mdp_dir: mdp
+  forcefield: amber99sb-ildn
+  water: tip3p
+  box_type: cubic
+  box_distance_nm: 1.0
+  salt_conc_m: 0.15
+  neutralize: true
+  threads: 0
+  gpu: false
+  skip_if_done: true
+  strip_5prime_phosphate: true
+  strip_3prime_phosphate: false
 ```
 
 ### 4.1 `run`
@@ -200,7 +221,16 @@ rescore:
 - `enabled`: turn rescoring on/off
 - `topM`: number of candidates selected from `topN.csv` for MMGBSA
 - `include_penalty`: whether penalty candidates are allowed into rescoring (usually false)
-
+  
+### 4.8`MD` 
+- `topX`: Set the first X sequences to run MD
+-  `forcefield`:Set force field type
+-  `water`:Set up a water model
+-  `box_distance_nm`:Solvent boundary distance
+-  `salt_conc_m`:salt concentration
+-  `threads`:CPU thread count (0=automatic)
+-  `gpu`:Whether to use GPU or not
+-  `skip_if_done`:Completed or skipped
 ---
 
 ## 5) Smoke test (verify multi-frame + multi-conformer + aggregation)
@@ -450,6 +480,10 @@ Recommended final selection strategy:
 3) keep a small diverse set (avoid near-duplicates)
 
 ---
+### 11.3 Molecular Dynamics : `/runs/ce_run1/md`
+The final summary results are presented in this document
+- `/runs/ce_run1/md/md_summary.csv`
+Contains information such as ranking, sequence, score, etc
 
 ## 12) Visualization
 
@@ -462,7 +496,9 @@ python scripts/visualize_run.py --run_dir runs/ce_run1
 
 Outputs:
 - `runs/ce_run1/plots/history_best_mean.png`
-- `runs/ce_run1/plots/history_penalty.png` (if penalty_frac exists)
-- `runs/ce_run1/plots/mmgbsa_by_iter.png` (if per-iter MMGBSA exists)
-- `runs/ce_run1/plots/mmgbsa_vs_vina.png` (if summaries exist)
+- `runs/ce_run1/plots/history_penalty.png` 
+- `runs/ce_run1/plots/mmgbsa_by_iter.png` 
+- `runs/ce_run1/plots/mmgbsa_vs_vina.png`
+- `runs/ce_run1/plots/md/rank_00x_rmsd.png`
+- `runs/ce_run1/plots/md/rank_00x_rmsf.png`
 
