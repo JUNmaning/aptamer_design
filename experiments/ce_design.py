@@ -982,6 +982,8 @@ def _run_cmd(cmd: List[str], cwd: Optional[str] = None, logger: Optional[logging
             line = line.rstrip("\n")
             if line:
                 logger.info(line)
+                if echo:
+                    print(line, flush=True)
         rc = p.wait()
     except KeyboardInterrupt:
         # Propagate Ctrl-C to the child (mdrun responds nicely).
@@ -1020,7 +1022,7 @@ def _entry_score(rec: Dict) -> float:
     return float("inf")
 
 
-def _run_cmd(cmd: List[str], cwd: Path, logger, input_text: Optional[str] = None) -> None:
+def _run_cmd_capture(cmd: List[str], cwd: Path, logger, input_text: Optional[str] = None) -> None:
     """Run a command, raise RuntimeError on failure, log stdout/stderr."""
     cwd.mkdir(parents=True, exist_ok=True)
     logger.info(f"[md] $ (cd {cwd}) {' '.join(cmd)}")
