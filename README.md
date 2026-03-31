@@ -69,13 +69,15 @@ Two files matter most for the feedback loop:
 
 ## 3) Environment & dependencies
 
-### 3.1 Recommended: Conda
+### 3.1 Recommended: mamba
 
 This project includes an `environment.yml`.
 
 ```bash
-conda env create -f environment.yml
-conda activate aptamer_design
+micromamba create -f environment.yml -y
+micromamba shell init -s bash -r /root/.local/share/mamba
+source ~/.bashrc
+micromamba activate aptamer_design
 ```
 
 ### 3.2 External tools required on your machine
