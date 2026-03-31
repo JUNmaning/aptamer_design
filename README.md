@@ -188,7 +188,7 @@ md:
 - `log_level`: logging verbosity
 
 ### 4.2 `inputs`
-- `ligand`: ligand file path (SDF/PDB)
+- `ligand`: ligand file path (SDF/PDB,It's best to name it 'ligand')
 
 ### 4.3 `ce` (Cross-Entropy optimizer)
 - `length`: RNA length
