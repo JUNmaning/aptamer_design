@@ -1,7 +1,6 @@
 # dock/vina.py
 from __future__ import annotations
 
-import math
 import re
 import shutil
 import subprocess
@@ -47,7 +46,6 @@ def _parse_pdb_coords(pdb: Path) -> List[Tuple[float, float, float]]:
     with pdb.open("r", errors="ignore") as f:
         for line in f:
             if line.startswith("ATOM") or line.startswith("HETATM"):
-                # PDB fixed columns: x[30:38], y[38:46], z[46:54]
                 try:
                     x = float(line[30:38].strip())
                     y = float(line[38:46].strip())
@@ -58,10 +56,13 @@ def _parse_pdb_coords(pdb: Path) -> List[Tuple[float, float, float]]:
     return coords
 
 
-def _compute_box_from_receptor_pdb(receptor_pdb: Path, padding: float, min_size: float = 20.0) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+def _compute_box_from_receptor_pdb(
+    receptor_pdb: Path,
+    padding: float,
+    min_size: float = 20.0,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
     coords = _parse_pdb_coords(receptor_pdb)
     if not coords:
-        # fallback: origin box
         center = (0.0, 0.0, 0.0)
         size = (min_size, min_size, min_size)
         return center, size
@@ -96,7 +97,6 @@ def _obabel_to_pdbqt(
     _which("obabel")
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    # infer input format
     ext = inp.suffix.lower().lstrip(".")
     if inp_fmt is None:
         inp_fmt = ext if ext else "pdb"
@@ -105,12 +105,10 @@ def _obabel_to_pdbqt(
     if add_h:
         cmd.append("-h")
     if gasteiger:
-        # OpenBabel widely supports this option
         cmd += ["--partialcharge", "gasteiger"]
 
     log = _run(cmd, cwd=cwd)
 
-    # strict check: must exist and not empty
     if (not out.exists()) or out.stat().st_size < 10:
         raise RuntimeError(
             f"OpenBabel conversion produced no pdbqt: {out}\n"
@@ -122,18 +120,17 @@ def _obabel_to_pdbqt(
 
 def _parse_vina_affinity(vina_log_text: str) -> float:
     """
-    Parse best affinity from vina log.
-    Looks for the table:
-      1    -7.3 ...
+    Parse best affinity from vina stdout/log.
+    Looks for lines like:
+      1    -7.3    0.000    0.000
     """
     lines = vina_log_text.splitlines()
-    # find first pose line beginning with "1"
     for ln in lines:
         ln_strip = ln.strip()
-        m = re.match(r"^1\s+(-?\d+(\.\d+)?)\s+", ln_strip)
+        m = re.match(r"^1\s+(-?\d+(?:\.\d+)?)\s+", ln_strip)
         if m:
             return float(m.group(1))
-    raise RuntimeError("Failed to parse affinity from vina log.")
+    raise RuntimeError("Failed to parse affinity from vina output.")
 
 
 def _sanitize_receptor_pdbqt(path: Path) -> None:
@@ -186,18 +183,15 @@ def dock_one(
     out_pdbqt = workdir / f"{name}.dock.pdbqt"
     log_file = workdir / f"{name}.vina.log"
 
-    # 1) compute docking box from receptor PDB
     center, size = _compute_box_from_receptor_pdb(receptor_pdb, padding=padding_angstrom)
 
-    # 2) convert receptor/ligand to pdbqt (strict)
-    # write convert logs for debugging
     try:
         rec_log = _obabel_to_pdbqt(receptor_pdb, receptor_pdbqt, inp_fmt="pdb", cwd=workdir)
         _sanitize_receptor_pdbqt(receptor_pdbqt)
         (workdir / f"{name}.receptor_convert.log").write_text(rec_log)
     except Exception as e:
         raise RuntimeError(f"Receptor PDB->PDBQT failed: {receptor_pdb}\n{repr(e)}")
-    # ligand input format inferred from suffix
+
     lig_ext = ligand_sdf.suffix.lower().lstrip(".")
     lig_fmt = lig_ext if lig_ext else "sdf"
     try:
@@ -206,7 +200,6 @@ def dock_one(
     except Exception as e:
         raise RuntimeError(f"Ligand -> PDBQT failed: {ligand_sdf}\n{repr(e)}")
 
-    # 3) run vina
     cmd = [
         "vina",
         "--receptor", str(receptor_pdbqt),
@@ -220,17 +213,14 @@ def dock_one(
         "--exhaustiveness", str(int(exhaustiveness)),
         "--num_modes", str(int(num_modes)),
         "--out", str(out_pdbqt),
-        "--log", str(log_file),
         "--seed", str(int(seed)),
         "--cpu", str(int(cpu)),
     ]
     vina_out = _run(cmd, cwd=workdir)
 
-    # vina writes the real score into log_file, read that for parsing
-    if not log_file.exists():
-        raise RuntimeError(f"Vina finished but no log file: {log_file}")
-
-    log_txt = log_file.read_text(errors="ignore")
+    # Some vina builds do not support --log, so capture stdout/stderr ourselves.
+    log_file.write_text(vina_out)
+    log_txt = vina_out
     affinity = _parse_vina_affinity(log_txt)
 
     return DockResult(
