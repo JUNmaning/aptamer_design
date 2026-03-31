@@ -59,7 +59,8 @@ print(os.path.expanduser("$RUN_DIR"))
 PY
 )"
 export RUN_DIR
-
+SIMRNA_CONFIG="$(yaml_get eval.simrna_config)"
+export SIMRNA_CONFIG
 # Defaults from YAML (fallback if missing)
 TOPM="$(yaml_get rescore.topM)"; TOPM="${TOPM:-5}"
 if [[ -n "${TOPM_IN}" ]]; then TOPM="${TOPM_IN}"; fi
