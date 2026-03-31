@@ -1,9 +1,10 @@
 name: aptamer_design
 channels:
   - conda-forge
-  - defaults
+
 dependencies:
   - python=3.10
+  - pip
   - numpy
   - scipy
   - pandas
@@ -11,6 +12,4 @@ dependencies:
   - tqdm
   - rdkit
   - openbabel
-  - pip
-  - pip:
-      - typing_extensions
+  - typing_extensions
