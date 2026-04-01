@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import time
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -938,74 +939,6 @@ def _gmx_supports(gmx: str, subcmd: str, flag: str) -> bool:
             _GMX_HELP_CACHE[key] = ""
     return flag in _GMX_HELP_CACHE[key]
 
-def _run_cmd(cmd: List[str], cwd: Optional[str] = None, logger: Optional[logging.Logger] = None, input_text: Optional[str] = None) -> None:
-    """Run a command and stream output in real time.
-
-    IMPORTANT:
-      - We intentionally DO NOT capture stdout/stderr into pipes without reading,
-        because long-running tools (e.g., `gmx mdrun`) will otherwise look "stuck"
-        and can also deadlock on full pipe buffers.
-      - Streaming output makes GROMACS show step / ETA lines when `-v`
-        are enabled.
-
-    Raises RuntimeError on non-zero return code.
-    """
-    import subprocess, signal
-
-    if logger is None:
-        logger = logging.getLogger(__name__)
-
-    # Print the exact command (shell-escaped-ish)
-    logger.info("[cmd] %s", " ".join(cmd))
-
-    p = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
-    if input_text is not None and p.stdin is not None:
-        try:
-            p.stdin.write(input_text)
-            p.stdin.flush()
-            p.stdin.close()
-        except Exception:
-            pass
-
-    try:
-        assert p.stdout is not None
-        for line in p.stdout:
-            line = line.rstrip("\n")
-            if line:
-                logger.info(line)
-        rc = p.wait()
-    except KeyboardInterrupt:
-        # Propagate Ctrl-C to the child (mdrun responds nicely).
-        try:
-            p.send_signal(signal.SIGINT)
-        except Exception:
-            pass
-        try:
-            rc = p.wait(timeout=10)
-        except Exception:
-            try:
-                p.kill()
-            except Exception:
-                pass
-        raise
-    finally:
-        try:
-            if p.stdout is not None:
-                p.stdout.close()
-        except Exception:
-            pass
-
-    if rc != 0:
-        raise RuntimeError(f"Command failed (rc={rc}): {' '.join(cmd)}")
 
 def _entry_score(rec: Dict) -> float:
     """Return the scalar used to rank candidates globally (lower is better)."""
@@ -1807,25 +1740,25 @@ def main() -> None:
                     logger=logger,
                 )
 
-                # checkpoint
-                checkpoint.write_text(
-                    json.dumps(
-                        {
-                            "iter_completed": iter_idx,
-                            "run_dir": str(run_dir),
-                            "ligand": str(ligand_file),
-                            "ligand_manifest": str(ligand_manifest) if ligand_manifest else "",
-                            "best": global_best,
-                            "best_prev": float(best_prev),
-                            "early_streak": int(early_streak),
-                            "collapse_streak": int(collapse_streak),
-                            "penalty_streak": int(penalty_streak),
-                            "stop_reason": stop_reason,
-                        },
-                        indent=2,
-                        ensure_ascii=False,
-                    )
+            # checkpoint (must be written every iter, regardless of rs_enabled)
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        "iter_completed": iter_idx,
+                        "run_dir": str(run_dir),
+                        "ligand": str(ligand_file),
+                        "ligand_manifest": str(ligand_manifest) if ligand_manifest else "",
+                        "best": global_best,
+                        "best_prev": float(best_prev),
+                        "early_streak": int(early_streak),
+                        "collapse_streak": int(collapse_streak),
+                        "penalty_streak": int(penalty_streak),
+                        "stop_reason": stop_reason,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
                 )
+            )
 
             logger.info(
                 f"[iter {iter_idx}] best={float(best['score']):.3f} mean={mean_score:.3f} elite={elite_n} "
