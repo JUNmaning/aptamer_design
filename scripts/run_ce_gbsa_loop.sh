@@ -8,14 +8,6 @@ log(){ echo "[$(ts)] [INFO] $*"; }
 warn(){ echo "[$(ts)] [WARN] $*" >&2; }
 die(){ echo "[$(ts)] [ERROR] $*" >&2; exit 1; }
 
-# -----------------------------
-# tunable stop criteria
-# -----------------------------
-GBSA_PATIENCE="${GBSA_PATIENCE:-5}"
-GBSA_MIN_IMPROVE="${GBSA_MIN_IMPROVE:-1.0}"   # kcal/mol, more negative is better
-DOCK_PATIENCE="${DOCK_PATIENCE:-6}"
-DOCK_MIN_IMPROVE="${DOCK_MIN_IMPROVE:-0.10}"  # docking score improvement threshold
-
 # --- tiny yaml getter ---
 yaml_get() {
   local key="$1"
@@ -52,17 +44,24 @@ RUN_PATH="$RUN_DIR"
 
 LOGFILE="/tmp/ce_gbsa_loop.$(date +%Y%m%d_%H%M%S).log"
 
-# optional knobs (can be absent in YAML; we fallback)
+# core knobs
 MAX_ITERS="$(yaml_get ce.iters)"; MAX_ITERS="${MAX_ITERS:-30}"
 BATCH="$(yaml_get ce.batch)"; BATCH="${BATCH:-24}"
 ELITE_N="$(yaml_get rescore.elite_n)"; ELITE_N="${ELITE_N:-5}"
 TOPM="$(yaml_get rescore.topM)"; TOPM="${TOPM:-5}"
 
+# external dual-stop knobs (read from YAML monitor.external_stop.*)
+GBSA_PATIENCE="$(yaml_get monitor.external_stop.gbsa_patience)"; GBSA_PATIENCE="${GBSA_PATIENCE:-5}"
+GBSA_MIN_IMPROVE="$(yaml_get monitor.external_stop.gbsa_min_improve)"; GBSA_MIN_IMPROVE="${GBSA_MIN_IMPROVE:-1.0}"
+
+DOCK_PATIENCE="$(yaml_get monitor.external_stop.dock_patience)"; DOCK_PATIENCE="${DOCK_PATIENCE:-6}"
+DOCK_MIN_IMPROVE="$(yaml_get monitor.external_stop.dock_min_improve)"; DOCK_MIN_IMPROVE="${DOCK_MIN_IMPROVE:-0.10}"
+
 log "config = $CFG"
 log "run_dir = $RUN_PATH"
 log "ce.iters=$MAX_ITERS, ce.batch=$BATCH, elite_n=$ELITE_N, topM=$TOPM"
 log "GBSA stop: patience=$GBSA_PATIENCE min_improve=$GBSA_MIN_IMPROVE"
-log "DOCK stop: patience=$DOCK_PATIENCE min_improve=$DOCK_MIN_IMPROVE"
+log "Dock stop: patience=$DOCK_PATIENCE min_improve=$DOCK_MIN_IMPROVE"
 log "log capture: $LOGFILE"
 
 CKPT="$RUN_PATH/checkpoint.json"
@@ -147,7 +146,6 @@ for c in ["dock_score","score","score_vina","vina_score"]:
         break
 out["dock_score"] = df[dock_col] if dock_col else float("nan")
 
-# feedback consumes this unified name
 out["stub_mmgbsa"] = pd.to_numeric(df["mmgbsa_dg_bind"], errors="coerce").fillna(1e9)
 
 for c in ["receptor_pdb","pose_pdbqt","mmgbsa_workdir","mmgbsa_ok"]:
@@ -162,7 +160,6 @@ print(out.head(3).to_string(index=False))
 PY
 }
 
-# --- feedback done marker / heuristics ---
 feedback_flag() {
   local iter="$1"
   echo "$RUN_PATH/rescore/iter_$(printf '%03d' "$iter")/feedback.done"
@@ -205,7 +202,6 @@ run_feedback() {
   touch "$(feedback_flag "$iter")" || true
 }
 
-# --- per-iter finalize: always do mmgbsa + results for the latest completed iter ---
 finalize_iter_if_needed() {
   local iter="$1"
   [[ "$iter" -ge 1 ]] || return 0
@@ -272,7 +268,7 @@ tail = vals[-pat:]
 best_old = tail[0][1]
 best_new = min(v for _, v in tail)
 
-# more negative is better, improvement = old - new
+# more negative is better
 improve = best_old - best_new
 if improve < thr:
     print("1")
@@ -353,12 +349,12 @@ while true; do
   reason="$(stop_reason)"
   log "checkpoint: iter_completed=$cur stop_reason='${reason}'"
 
-  # 1) if CE has completed to cur, ensure MMGBSA/results exist for cur
+  # 1) ensure MMGBSA/results exist for current iter
   if [[ "$cur" -ge 1 ]]; then
     finalize_iter_if_needed "$cur"
   fi
 
-  # 2) external stop checks after MMGBSA/results are available
+  # 2) dual plateau stop check
   if [[ -z "$reason" && "$cur" -ge 1 ]]; then
     if [[ "$(gbsa_stop_triggered)" == "1" ]]; then
       reason="$(set_external_stop_reason "gbsa_plateau(patience=${GBSA_PATIENCE}, min_improve=${GBSA_MIN_IMPROVE})")"
@@ -369,7 +365,7 @@ while true; do
     fi
   fi
 
-  # 3) if still continuing, ensure feedback for cur
+  # 3) if continuing, feedback current iter
   if [[ -z "$reason" && "$cur" -ge 1 && "$cur" -lt "$MAX_ITERS" ]]; then
     if feedback_done "$cur"; then
       log "FEEDBACK: SKIP (already done): iter=$cur"
@@ -388,7 +384,7 @@ while true; do
     break
   fi
 
-  # 5) run next iteration
+  # 5) run next iter
   target=$((cur+1))
   run_ce_to_iter "$target"
 
