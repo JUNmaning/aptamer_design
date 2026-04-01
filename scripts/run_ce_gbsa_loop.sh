@@ -19,15 +19,15 @@ except Exception:
     print("")
     sys.exit(0)
 
-cfg_path=sys.argv[1]
-key=sys.argv[2]
-d=yaml.safe_load(open(cfg_path,'r'))
-cur=d
+cfg_path = sys.argv[1]
+key = sys.argv[2]
+d = yaml.safe_load(open(cfg_path, 'r'))
+cur = d
 for part in key.split('.'):
     if cur is None or part not in cur:
         print("")
         sys.exit(0)
-    cur=cur[part]
+    cur = cur[part]
 print(cur if cur is not None else "")
 PY
 }
@@ -44,11 +44,18 @@ RUN_PATH="$RUN_DIR"
 
 LOGFILE="/tmp/ce_gbsa_loop.$(date +%Y%m%d_%H%M%S).log"
 
+# -----------------------------
 # core knobs
+# -----------------------------
 MAX_ITERS="$(yaml_get ce.iters)"; MAX_ITERS="${MAX_ITERS:-30}"
 BATCH="$(yaml_get ce.batch)"; BATCH="${BATCH:-24}"
-ELITE_N="$(yaml_get rescore.elite_n)"; ELITE_N="${ELITE_N:-5}"
-TOPM="$(yaml_get rescore.topM)"; TOPM="${TOPM:-5}"
+
+# rescore candidate selection: ratio-first, fallback-to-fixed
+TOPM_RAW="$(yaml_get rescore.topM)"; TOPM_RAW="${TOPM_RAW:-5}"
+TOP_FRAC="$(yaml_get rescore.top_frac)"; TOP_FRAC="${TOP_FRAC:-}"
+
+ELITE_N_RAW="$(yaml_get rescore.elite_n)"; ELITE_N_RAW="${ELITE_N_RAW:-5}"
+ELITE_FRAC="$(yaml_get rescore.elite_frac)"; ELITE_FRAC="${ELITE_FRAC:-}"
 
 # external dual-stop knobs (read from YAML monitor.external_stop.*)
 GBSA_PATIENCE="$(yaml_get monitor.external_stop.gbsa_patience)"; GBSA_PATIENCE="${GBSA_PATIENCE:-5}"
@@ -57,9 +64,48 @@ GBSA_MIN_IMPROVE="$(yaml_get monitor.external_stop.gbsa_min_improve)"; GBSA_MIN_
 DOCK_PATIENCE="$(yaml_get monitor.external_stop.dock_patience)"; DOCK_PATIENCE="${DOCK_PATIENCE:-6}"
 DOCK_MIN_IMPROVE="$(yaml_get monitor.external_stop.dock_min_improve)"; DOCK_MIN_IMPROVE="${DOCK_MIN_IMPROVE:-0.10}"
 
+calc_topm() {
+  python - <<PY
+import math
+batch = int("$BATCH")
+top_frac = "$TOP_FRAC".strip()
+topm_raw = int("$TOPM_RAW")
+if top_frac:
+    try:
+        v = max(1, int(math.ceil(batch * float(top_frac))))
+        print(v)
+    except Exception:
+        print(topm_raw)
+else:
+    print(topm_raw)
+PY
+}
+
+calc_elite_n() {
+  python - <<PY
+import math
+topm = int("$TOPM")
+elite_frac = "$ELITE_FRAC".strip()
+elite_n_raw = int("$ELITE_N_RAW")
+if elite_frac:
+    try:
+        v = max(1, int(math.ceil(topm * float(elite_frac))))
+        print(v)
+    except Exception:
+        print(elite_n_raw)
+else:
+    print(elite_n_raw)
+PY
+}
+
+TOPM="$(calc_topm)"
+ELITE_N="$(calc_elite_n)"
+
 log "config = $CFG"
 log "run_dir = $RUN_PATH"
-log "ce.iters=$MAX_ITERS, ce.batch=$BATCH, elite_n=$ELITE_N, topM=$TOPM"
+log "ce.iters=$MAX_ITERS, ce.batch=$BATCH"
+log "rescore selection: topM=$TOPM (top_frac=${TOP_FRAC:-<none>}, topM_raw=$TOPM_RAW)"
+log "feedback elite: elite_n=$ELITE_N (elite_frac=${ELITE_FRAC:-<none>}, elite_n_raw=$ELITE_N_RAW)"
 log "GBSA stop: patience=$GBSA_PATIENCE min_improve=$GBSA_MIN_IMPROVE"
 log "Dock stop: patience=$DOCK_PATIENCE min_improve=$DOCK_MIN_IMPROVE"
 log "log capture: $LOGFILE"
@@ -104,7 +150,7 @@ run_ce_to_iter() {
 
 run_mmgbsa_for_iter() {
   local iter="$1"
-  log "MMGBSA: iter=$iter"
+  log "MMGBSA: iter=$iter (topM=$TOPM)"
   python -m experiments.rescore_mmgbsa \
     --run_dir "$RUN_PATH" \
     --iter "$iter" \
