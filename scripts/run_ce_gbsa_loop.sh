@@ -1,276 +1,198 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CFG="${1:-configs/run_default.yaml}"
+CFG_IN="${1:-configs/run_default.yaml}"
 
-ts(){ date +"%Y-%m-%d %H:%M:%S"; }
-log(){ echo "[$(ts)] [INFO] $*"; }
-die(){ echo "[$(ts)] [ERROR] $*" >&2; exit 1; }
+if [[ ! -f "$CFG_IN" ]]; then
+  echo "[FATAL] config not found: $CFG_IN" >&2
+  exit 1
+fi
 
-# --- tiny yaml getter ---
-yaml_get() {
-  local key="$1"
-  python - "$CFG" "$key" <<'PY'
-import sys
-try:
-    import yaml
-except Exception:
-    print("")
-    sys.exit(0)
+ts() { date +"%F %T"; }
 
-cfg_path=sys.argv[1]
-key=sys.argv[2]
-d=yaml.safe_load(open(cfg_path,'r'))
-cur=d
-for part in key.split('.'):
+py_get_yaml() {
+python - <<'PY' "$1" "$2"
+import sys, yaml
+cfg_path, dotted = sys.argv[1], sys.argv[2]
+with open(cfg_path, "r") as f:
+    d = yaml.safe_load(f)
+
+cur = d
+for part in dotted.split("."):
     if cur is None or part not in cur:
         print("")
-        sys.exit(0)
-    cur=cur[part]
+        raise SystemExit(0)
+    cur = cur[part]
 print(cur if cur is not None else "")
 PY
 }
 
-RUN_DIR="$(yaml_get run.run_dir)"
-[[ -n "${RUN_DIR}" ]] || die "Cannot read run.run_dir from $CFG (is the YAML key correct?)"
-RUN_DIR="$(python - <<PY
-import os
-print(os.path.expanduser("$RUN_DIR"))
+py_write_stage_cfg() {
+# args: in_cfg out_cfg iters resume_bool
+python - <<'PY' "$1" "$2" "$3" "$4"
+import sys, yaml
+in_cfg, out_cfg, iters_s, resume_s = sys.argv[1:5]
+iters = int(iters_s)
+resume = resume_s.lower() in ("1","true","yes","y")
+
+with open(in_cfg, "r") as f:
+    d = yaml.safe_load(f)
+
+d.setdefault("run", {})
+d["run"]["resume"] = resume
+
+d.setdefault("ce", {})
+d["ce"]["iters"] = iters
+
+with open(out_cfg, "w") as f:
+    yaml.safe_dump(d, f, sort_keys=False)
+
+print(f"[OK] wrote stage config: {out_cfg} (iters={iters}, resume={resume})")
 PY
-)"
+}
+
+echo "[$(ts)] [INFO] input config: $CFG_IN"
+
+RUN_DIR="$(py_get_yaml "$CFG_IN" "run.run_dir")"
+if [[ -z "${RUN_DIR}" ]]; then
+  echo "[FATAL] cannot read run.run_dir from $CFG_IN" >&2
+  exit 1
+fi
 export RUN_DIR
-RUN_PATH="$RUN_DIR"
+echo "[$(ts)] [INFO] run_dir from config: $RUN_DIR"
 
-LOGFILE="/tmp/ce_gbsa_loop.$(date +%Y%m%d_%H%M%S).log"
+CE_BATCH="$(py_get_yaml "$CFG_IN" "ce.batch")"
+CE_BATCH="${CE_BATCH:-24}"
 
-# optional knobs (can be absent in YAML; we fallback)
-MAX_ITERS="$(yaml_get ce.iters)"; MAX_ITERS="${MAX_ITERS:-30}"
-BATCH="$(yaml_get ce.batch)"; BATCH="${BATCH:-24}"
-ELITE_N="$(yaml_get rescore.elite_n)"; ELITE_N="${ELITE_N:-5}"
-TOPM="$(yaml_get rescore.topM)"; TOPM="${TOPM:-5}"
+TOPM="$(py_get_yaml "$CFG_IN" "rescore.topM")"
+TOPM="${TOPM:-5}"
 
-log "config = $CFG"
-log "run_dir = $RUN_PATH"
-log "ce.iters=$MAX_ITERS, ce.batch=$BATCH, elite_n=$ELITE_N, topM=$TOPM"
-log "log capture: $LOGFILE"
+echo "[$(ts)] [INFO] ce.batch=$CE_BATCH, rescore.topM=$TOPM"
 
-CKPT="$RUN_PATH/checkpoint.json"
+STAGE1_CFG="/tmp/ce_stage_iter1.yaml"
+STAGE2_CFG="/tmp/ce_stage_iter2_resume.yaml"
 
-iter_completed() {
-  python - <<PY
-import json
-p="$CKPT"
-try:
-    j=json.load(open(p))
-    print(int(j.get("iter_completed",0)))
-except Exception:
-    print(0)
-PY
-}
+py_write_stage_cfg "$CFG_IN" "$STAGE1_CFG" 1 false
+py_write_stage_cfg "$CFG_IN" "$STAGE2_CFG" 2 true
 
-stop_reason() {
-  python - <<PY
-import json
-p="$CKPT"
-try:
-    j=json.load(open(p))
-    print((j.get("stop_reason") or "").strip())
-except Exception:
-    print("")
-PY
-}
+LOG1="/tmp/ce_iter1_$(basename "$RUN_DIR").log"
+LOG2="/tmp/ce_iter2_$(basename "$RUN_DIR").log"
 
-need_manifest() {
-  local iter="$1"
-  local m="$RUN_PATH/rescore/iter_$(printf '%03d' "$iter")/manifest.jsonl"
-  [[ -f "$m" ]] || die "missing manifest.jsonl for iter=$iter: $m"
-}
+ITER_DIR="$RUN_DIR/rescore/iter_001"
+MANIFEST="$ITER_DIR/manifest.jsonl"
 
-run_ce_to_iter() {
-  local target="$1"
-  log "CE: run/resume to iter=$target"
-  python -m experiments.ce_design --config "$CFG" --iters "$target" 2>&1 | tee -a "$LOGFILE"
-}
+# ---- Stage 1: CE iters=1 (only if manifest missing) ----
+if [[ -f "$MANIFEST" ]]; then
+  echo "[$(ts)] [INFO] Stage1: SKIP (manifest already exists): $MANIFEST"
+else
+  echo "[$(ts)] [INFO] Stage1: ce_design iters=1"
+  python -m experiments.ce_design --config "$STAGE1_CFG" 2>&1 | tee "$LOG1"
 
-run_mmgbsa_for_iter() {
-  local iter="$1"
-  log "MMGBSA: iter=$iter"
-  python -m experiments.rescore_mmgbsa \
-    --run_dir "$RUN_PATH" \
-    --iter "$iter" \
-    --topM "$TOPM" \
-    --keep_tmp \
-    --workers 1 \
-    2>&1 | tee -a "$LOGFILE"
-}
+  if [[ ! -f "$MANIFEST" ]]; then
+    echo "[FATAL] manifest not found after Stage1: $MANIFEST" >&2
+    echo "Hint: ensure rescore.enabled=true in config." >&2
+    exit 1
+  fi
+fi
 
-build_results_csv_for_feedback() {
-  local iter="$1"
-  local resdir="$RUN_PATH/rescore/iter_$(printf '%03d' "$iter")"
-  local in_csv="$resdir/mmgbsa_results.csv"
-  local out_csv="$resdir/results.csv"
-  [[ -f "$in_csv" ]] || die "missing mmgbsa_results.csv: $in_csv"
-  log "Build results.csv: $out_csv"
+echo "[$(ts)] [OK] manifest exists: $MANIFEST"
+echo "[$(ts)] [INFO] manifest head:"
+head -n 2 "$MANIFEST" || true
 
-  python - "$iter" "$in_csv" "$out_csv" <<'PY'
-import os, sys
+# ---- Stage 2: MM/GBSA ----
+echo "[$(ts)] [INFO] Stage2: rescore_mmgbsa (real)"
+python -m experiments.rescore_mmgbsa \
+  --run_dir "$RUN_DIR" \
+  --iter 1 \
+  --topM "$TOPM" \
+  --workers 1 \
+  --igb 5 \
+  --saltcon 0.150 \
+  --charge_method bcc
+
+MMCSV="$ITER_DIR/mmgbsa_results.csv"
+if [[ ! -f "$MMCSV" ]]; then
+  echo "[FATAL] mmgbsa_results.csv not found: $MMCSV" >&2
+  exit 1
+fi
+echo "[$(ts)] [OK] mmgbsa_results.csv exists: $MMCSV"
+echo "[$(ts)] [INFO] mmgbsa_results.csv head:"
+head -n 3 "$MMCSV" || true
+
+# ---- Stage 3: build results.csv for feedback ----
+echo "[$(ts)] [INFO] Stage3: build $ITER_DIR/results.csv (map mmgbsa_dg_bind -> stub_mmgbsa)"
+python - <<'PY'
+import os
+from pathlib import Path
 import pandas as pd
 
-iter_i = int(sys.argv[1])
-in_csv = sys.argv[2]
-out_csv = sys.argv[3]
+run_dir = Path(os.environ["RUN_DIR"])
+iter_dir = run_dir / "rescore" / "iter_001"
+src = iter_dir / "mmgbsa_results.csv"
+dst = iter_dir / "results.csv"
 
-df = pd.read_csv(in_csv)
-if "seq" not in df.columns or "mmgbsa_dg_bind" not in df.columns:
-    raise SystemExit("mmgbsa_results.csv missing required columns: seq/mmgbsa_dg_bind")
+df = pd.read_csv(src)
 
 out = pd.DataFrame()
-out["iter"] = iter_i
-out["rank"] = df.get("rank", pd.Series(range(1, len(df)+1)))
-out["seq"]  = df["seq"]
+out["iter"] = 1
+out["rank"] = df["rank"] if "rank" in df.columns else range(1, len(df)+1)
+out["seq"] = df["seq"]
 
 dock_col = None
-for c in ["dock_score","score","score_vina","vina_score"]:
+for c in ["dock_score", "score", "score_vina", "vina_score"]:
     if c in df.columns:
         dock_col = c
         break
 out["dock_score"] = df[dock_col] if dock_col else float("nan")
 
-# 给 feedback 用的统一列名（你的 gbsa_feedback_once 读 stub_mmgbsa）
+if "mmgbsa_dg_bind" not in df.columns:
+    raise RuntimeError("mmgbsa_dg_bind not found in mmgbsa_results.csv")
 out["stub_mmgbsa"] = pd.to_numeric(df["mmgbsa_dg_bind"], errors="coerce").fillna(1e9)
 
-for c in ["receptor_pdb","pose_pdbqt","mmgbsa_workdir","mmgbsa_ok"]:
+for c in ["receptor_pdb", "pose_pdbqt", "mmgbsa_workdir", "mmgbsa_ok"]:
     out[c] = df[c] if c in df.columns else ""
 
 out["receptor_exists"] = out["receptor_pdb"].apply(lambda p: bool(p) and os.path.exists(p))
 out["pose_exists"] = out["pose_pdbqt"].apply(lambda p: bool(p) and os.path.exists(p))
 
-out.to_csv(out_csv, index=False)
-print("WROTE", out_csv, "rows=", len(out))
+out.to_csv(dst, index=False)
+print("[OK] wrote", dst, "rows=", len(out))
 print(out.head(3).to_string(index=False))
 PY
-}
 
-# --- feedback done marker / heuristics ---
-feedback_flag() {
-  local iter="$1"
-  echo "$RUN_PATH/rescore/iter_$(printf '%03d' "$iter")/feedback.done"
-}
-
-feedback_done() {
-  local iter="$1"
-  local flag
-  flag="$(feedback_flag "$iter")"
-  if [[ -f "$flag" ]]; then
-    return 0
-  fi
-
-  # 兼容你之前跑过但没写 flag 的情况：用时间戳粗略判断是否已经做过 feedback
-  local resdir="$RUN_PATH/rescore/iter_$(printf '%03d' "$iter")"
-  local results="$resdir/results.csv"
-  local dist="$RUN_PATH/dist.json"
-  local next="$RUN_PATH/next_batch.txt"
-  if [[ -f "$results" && -f "$dist" && -f "$next" ]]; then
-    # 如果 dist/next 比 results 更新，基本说明已做过 feedback（至少生成过下一批）
-    if [[ "$dist" -nt "$results" && "$next" -nt "$results" ]]; then
-      touch "$flag" || true
-      return 0
-    fi
-  fi
-  return 1
-}
-
-run_feedback() {
-  local iter="$1"
-  log "FEEDBACK: gbsa_feedback_once iter=$iter (batch=$BATCH elite_n=$ELITE_N)"
-  python -m experiments.gbsa_feedback_once \
-    --run_dir "$RUN_PATH" \
-    --iter "$iter" \
-    --batch "$BATCH" \
-    --elite_n "$ELITE_N" \
-    2>&1 | tee -a "$LOGFILE"
-
-  [[ -f "$RUN_PATH/dist.json" ]] || die "dist.json not found after feedback"
-  [[ -f "$RUN_PATH/next_batch.txt" ]] || die "next_batch.txt not found after feedback"
-
-  touch "$(feedback_flag "$iter")" || true
-}
-
-# --- per-iter finalize: always do mmgbsa + results for the latest completed iter ---
-finalize_iter_if_needed() {
-  local iter="$1"
-  [[ "$iter" -ge 1 ]] || return 0
-
-  local resdir="$RUN_PATH/rescore/iter_$(printf '%03d' "$iter")"
-  local mmcsv="$resdir/mmgbsa_results.csv"
-  local results="$resdir/results.csv"
-
-  need_manifest "$iter"
-
-  if [[ ! -f "$mmcsv" ]]; then
-    run_mmgbsa_for_iter "$iter"
-  else
-    log "MMGBSA: SKIP (exists): $mmcsv"
-  fi
-
-  if [[ ! -f "$results" ]]; then
-    build_results_csv_for_feedback "$iter"
-  else
-    log "results.csv: SKIP (exists): $results"
-  fi
-}
-
-log "==== START LOOP ===="
-
-while true; do
-  cur="$(iter_completed)"
-  reason="$(stop_reason)"
-  log "checkpoint: iter_completed=$cur stop_reason='${reason}'"
-
-  # 1) 只要 CE 已经完成到 cur，就保证 cur 的 MMGBSA + results.csv 一定存在
-  if [[ "$cur" -ge 1 ]]; then
-    finalize_iter_if_needed "$cur"
-  fi
-
-  # 2) 如果还会继续跑下一轮，那么必须确保对 cur 做过 feedback（用于生成 next_batch + 更新 dist）
-  if [[ -z "$reason" && "$cur" -ge 1 && "$cur" -lt "$MAX_ITERS" ]]; then
-    if feedback_done "$cur"; then
-      log "FEEDBACK: SKIP (already done): iter=$cur"
-    else
-      run_feedback "$cur"
-    fi
-  fi
-
-  # 3) 终止条件：已经 stop 或已到 MAX_ITERS
-  if [[ -n "$reason" ]]; then
-    log "CE stopped (stop_reason=$reason). break."
-    break
-  fi
-  if [[ "$cur" -ge "$MAX_ITERS" ]]; then
-    log "Reached ce.iters=$MAX_ITERS. break."
-    break
-  fi
-
-  # 4) 跑到下一轮（cur+1）
-  target=$((cur+1))
-  run_ce_to_iter "$target"
-
-  new_cur="$(iter_completed)"
-  reason="$(stop_reason)"
-  log "after CE: iter_completed=$new_cur stop_reason='${reason}'"
-
-  if [[ -n "$reason" || "$new_cur" -lt "$target" ]]; then
-    log "CE stopped early. break."
-    break
-  fi
-done
-# after DONE LOOP
-if [[ "$(yaml_get md.enabled)" == "True" || "$(yaml_get md.enabled)" == "true" ]]; then
-  log "MD postprocess: run md_only"
-  python -m experiments.ce_design --config "$CFG" --md_only 2>&1 | tee -a "$LOGFILE"
+RESULTS="$ITER_DIR/results.csv"
+if [[ ! -f "$RESULTS" ]]; then
+  echo "[FATAL] results.csv not found: $RESULTS" >&2
+  exit 1
 fi
-log "==== DONE LOOP ===="
-log "Run dir: $RUN_PATH"
-log "Check: $RUN_PATH/checkpoint.json and $RUN_PATH/logs/ce_design.log"
-echo
-echo "[OK] Finished. Log: $LOGFILE"
+
+# ---- Stage 4: feedback ----
+echo "[$(ts)] [INFO] Stage4: gbsa_feedback_once (update dist.json + next_batch.txt)"
+python -m experiments.gbsa_feedback_once \
+  --run_dir "$RUN_DIR" \
+  --iter 1 \
+  --batch "$CE_BATCH" \
+  --elite_n 5
+
+if [[ ! -f "$RUN_DIR/dist.json" ]]; then
+  echo "[FATAL] dist.json not found after feedback: $RUN_DIR/dist.json" >&2
+  exit 1
+fi
+if [[ ! -f "$RUN_DIR/next_batch.txt" ]]; then
+  echo "[FATAL] next_batch.txt not found after feedback: $RUN_DIR/next_batch.txt" >&2
+  exit 1
+fi
+
+echo "[$(ts)] [OK] dist.json updated: $RUN_DIR/dist.json"
+echo "[$(ts)] [OK] next_batch.txt written: $RUN_DIR/next_batch.txt"
+echo "[$(ts)] [INFO] next_batch head:"
+head -n 5 "$RUN_DIR/next_batch.txt" || true
+
+# ---- Stage 5: resume CE to iters=2 ----
+echo "[$(ts)] [INFO] Stage5: resume ce_design to iters=2"
+python -m experiments.ce_design --config "$STAGE2_CFG" 2>&1 | tee "$LOG2"
+
+echo "[$(ts)] [DONE] One round complete (iter1 -> mmgbsa -> dist update -> iter2 resume)."
+echo "Logs:"
+echo "  $LOG1"
+echo "  $LOG2"
