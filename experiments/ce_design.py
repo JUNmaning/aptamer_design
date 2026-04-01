@@ -982,8 +982,6 @@ def _run_cmd(cmd: List[str], cwd: Optional[str] = None, logger: Optional[logging
             line = line.rstrip("\n")
             if line:
                 logger.info(line)
-                if echo:
-                    print(line, flush=True)
         rc = p.wait()
     except KeyboardInterrupt:
         # Propagate Ctrl-C to the child (mdrun responds nicely).
@@ -1022,7 +1020,7 @@ def _entry_score(rec: Dict) -> float:
     return float("inf")
 
 
-def _run_cmd_capture(cmd: List[str], cwd: Path, logger, input_text: Optional[str] = None) -> None:
+def _run_cmd(cmd: List[str], cwd: Path, logger, input_text: Optional[str] = None) -> None:
     """Run a command, raise RuntimeError on failure, log stdout/stderr."""
     cwd.mkdir(parents=True, exist_ok=True)
     logger.info(f"[md] $ (cd {cwd}) {' '.join(cmd)}")
@@ -1066,9 +1064,6 @@ def _mdrun_cmd(gmx: str, deffnm: str, threads: int, gpu: bool) -> List[str]:
     # Make progress visible (frequent log updates with -v; ETA shows near the end of the run).
     cmd += ["-v"]
 
-    # Reduce I/O; still writes deffnm.gro at the end (final coordinates), plus log/edr.
-    cmd += ["-noconfout"]
-
     # Pin threads for better performance/consistency.
     cmd += ["-pin", "on"]
 
@@ -1079,73 +1074,42 @@ def _mdrun_cmd(gmx: str, deffnm: str, threads: int, gpu: bool) -> List[str]:
 
 
 def _run_md_analysis(gmx: str, workdir: str, logger: logging.Logger) -> None:
-    """Run post-MD analysis (RMSD/RMSF) non-interactively.
-
-    Notes
-    -----
-    GROMACS tools like `gmx rms` / `gmx rmsf` are interactive by default (they ask you to pick groups).
-    In our workflows the system is often RNA-only, so default groups like 'Backbone'/'C-alpha' may not exist.
-    We therefore try a small set of reasonable group selections, falling back to the 'RNA' group (often #1),
-    and finally to group index 0/1 if needed.
     """
-    tpr = Path(workdir) / "md.tpr"
-    xtc = Path(workdir) / "md.xtc"
-    if not (tpr.exists() and xtc.exists()):
+    Run post-MD analysis (RMSD/RMSF) with auto-recovery.
+    Only compute missing outputs.
+    """
+
+    workdir = Path(workdir)
+    tpr = workdir / "md.tpr"
+    xtc = workdir / "md.xtc"
+    rmsd_xvg = workdir / "rmsd.xvg"
+    rmsf_xvg = workdir / "rmsf.xvg"
+
+    if not tpr.exists() or not xtc.exists():
+        logger.warning("[md] md.tpr or md.xtc missing, skip analysis")
         return
 
-    def _try_rms() -> bool:
-        # Each attempt is (fit, rms) where values are either group names or numeric indices as strings.
-        attempts = [
-            ("Backbone", "Backbone"),
-            ("C-alpha", "C-alpha"),
-            ("Protein", "Protein"),
-            ("RNA", "RNA"),
-            ("1", "1"),  # common: RNA is group 1
-            ("0", "0"),  # System
-        ]
-        for fit, grp in attempts:
+    # ---------- RMSD ----------
+    if not rmsd_xvg.exists():
+        try:
+            logger.info("[md] RMSD: calculating (RNA group index=1)")
             cmd = [gmx, "rms", "-s", "md.tpr", "-f", "md.xtc", "-o", "rmsd.xvg", "-tu", "ns"]
-            sel = f"{fit}\n{grp}\n"
-            logger.info(f"[md] trying RMSD selection fit={fit!r} group={grp!r}")
-            try:
-                _run_cmd(cmd, cwd=workdir, logger=logger, input_text=sel)
-                return True
-            except RuntimeError as e:
-                msg = str(e)
-                # If selection isn't found, try next; otherwise keep trying anyway.
-                logger.warning(f"[md] RMSD attempt failed (fit={fit}, group={grp}): {msg.splitlines()[-1] if msg else msg}")
-                continue
-        return False
+            _run_cmd(cmd, workdir, logger, input_text="1\n1\n")
+        except Exception as e:
+            logger.warning(f"[md] RMSD failed: {e}")
+    else:
+        logger.info("[md] RMSD: exists, skip")
 
-    def _try_rmsf() -> bool:
-        attempts = [
-            "Backbone",
-            "C-alpha",
-            "Protein",
-            "RNA",
-            "1",
-            "0",
-        ]
-        for grp in attempts:
+    # ---------- RMSF ----------
+    if not rmsf_xvg.exists():
+        try:
+            logger.info("[md] RMSF: calculating (RNA group index=1)")
             cmd = [gmx, "rmsf", "-s", "md.tpr", "-f", "md.xtc", "-o", "rmsf.xvg", "-res"]
-            sel = f"{grp}\n"
-            logger.info(f"[md] trying RMSF selection group={grp!r}")
-            try:
-                _run_cmd(cmd, cwd=workdir, logger=logger, input_text=sel)
-                return True
-            except RuntimeError as e:
-                msg = str(e)
-                logger.warning(f"[md] RMSF attempt failed (group={grp}): {msg.splitlines()[-1] if msg else msg}")
-                continue
-        return False
-
-    ok_rmsd = _try_rms()
-    ok_rmsf = _try_rmsf()
-    if not ok_rmsd:
-        logger.warning("[md] RMSD analysis did not produce rmsd.xvg (all selection attempts failed).")
-    if not ok_rmsf:
-        logger.warning("[md] RMSF analysis did not produce rmsf.xvg (all selection attempts failed).")
-
+            _run_cmd(cmd, workdir, logger, input_text="1\n")
+        except Exception as e:
+            logger.warning(f"[md] RMSF failed: {e}")
+    else:
+        logger.info("[md] RMSF: exists, skip")
 
 def _sanitize_rna_pdb(
     in_pdb: Path,
@@ -1355,9 +1319,17 @@ def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig,
             err = "no_pdb_in_cache"
         else:
             # Skip if done
-            if md_cfg.skip_if_done and (workdir / "md.xtc").exists() and (workdir / "md.gro").exists():
+            xtc_file = workdir / "md.xtc"
+            gro_file = workdir / "md.gro"
+
+            if md_cfg.skip_if_done and xtc_file.exists() and gro_file.exists():
+                logger.info(f"[md] rank={rank:03d} MD exists, skip simulation, run analysis only")
+                try:
+                    _run_md_analysis(md_cfg.gmx, str(workdir), logger)
+                except Exception as e:
+                    logger.warning(f"[md] rank={rank:03d} analysis failed: {e}")
                 status = "skip"
-                err = "already_done"
+                err = "analysis_checked"
             else:
                 try:
                     t0 = time.time()
@@ -1385,17 +1357,18 @@ def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig,
                     err = str(e).splitlines()[0][:240]
                     logger.error(f"[md] rank={rank:03d} FAILED: {e}")
 
-        summary_rows.append({
-            "rank": rank,
-            "seq": seq,
-            "score": score,
-            "workdir": str(workdir),
-            "status": status,
-            "error": err,
-        })
 
-    write_csv(md_root / "md_summary.csv", summary_rows, fieldnames=["rank", "seq", "score", "workdir", "status", "error"])
-    logger.info(f"[md] summary -> {md_root / 'md_summary.csv'}")
+                    summary_rows.append({
+                        "rank": rank,
+                        "seq": seq,
+                        "score": score,
+                        "workdir": str(workdir),
+                        "status": status,
+                        "error": err,
+                    })
+
+                write_csv(md_root / "md_summary.csv", summary_rows, fieldnames=["rank", "seq", "score", "workdir", "status", "error"])
+                logger.info(f"[md] summary -> {md_root / 'md_summary.csv'}")
 
 
 def main() -> None:
@@ -1565,15 +1538,16 @@ def main() -> None:
         iters = int(cfg["ce"]["iters"])
         topN_keep = int(cfg["ce"].get("topN", 20))
         # -----------------------------
-        # Resume semantics for iteration counter
+        # Resume semantics for iteration counter + monitor state
         # -----------------------------
-        # If run.resume=true and checkpoint.json exists, continue from iter_completed+1.
+        ck: Dict = {}
         start_iter = 1
         if resume and checkpoint.exists():
             try:
                 ck = json.loads(checkpoint.read_text())
                 start_iter = int(ck.get("iter_completed", 0)) + 1
             except Exception:
+                ck = {}
                 start_iter = 1
 
         # Avoid duplicate history rows when re-running with resume.
@@ -1646,12 +1620,20 @@ def main() -> None:
         )
 
 
-        early_streak = 0
-        collapse_streak = 0
-        penalty_streak = 0
+        # Restore monitor state from checkpoint so resume does not reset streaks
+        early_streak = int(ck.get("early_streak", 0)) if isinstance(ck, dict) else 0
+        collapse_streak = int(ck.get("collapse_streak", 0)) if isinstance(ck, dict) else 0
+        penalty_streak = int(ck.get("penalty_streak", 0)) if isinstance(ck, dict) else 0
 
-        best_prev = float(global_best["score"]) if global_best else 1e9
-        stop_reason = ""
+        if isinstance(ck, dict) and ck.get("best_prev", None) is not None:
+            try:
+                best_prev = float(ck.get("best_prev"))
+            except Exception:
+                best_prev = float(global_best["score"]) if global_best else 1e9
+        else:
+            best_prev = float(global_best["score"]) if global_best else 1e9
+
+        stop_reason = str(ck.get("stop_reason", "")) if isinstance(ck, dict) else ""
 
         for iter_idx in range(start_iter, iters + 1):
             # sample batch
@@ -1825,21 +1807,25 @@ def main() -> None:
                     logger=logger,
                 )
 
-            # checkpoint
-            checkpoint.write_text(
-                json.dumps(
-                    {
-                        "iter_completed": iter_idx,
-                        "run_dir": str(run_dir),
-                        "ligand": str(ligand_file),
-                        "ligand_manifest": str(ligand_manifest) if ligand_manifest else "",
-                        "best": global_best,
-                        "stop_reason": stop_reason,
-                    },
-                    indent=2,
-                    ensure_ascii=False,
+                # checkpoint
+                checkpoint.write_text(
+                    json.dumps(
+                        {
+                            "iter_completed": iter_idx,
+                            "run_dir": str(run_dir),
+                            "ligand": str(ligand_file),
+                            "ligand_manifest": str(ligand_manifest) if ligand_manifest else "",
+                            "best": global_best,
+                            "best_prev": float(best_prev),
+                            "early_streak": int(early_streak),
+                            "collapse_streak": int(collapse_streak),
+                            "penalty_streak": int(penalty_streak),
+                            "stop_reason": stop_reason,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
                 )
-            )
 
             logger.info(
                 f"[iter {iter_idx}] best={float(best['score']):.3f} mean={mean_score:.3f} elite={elite_n} "
