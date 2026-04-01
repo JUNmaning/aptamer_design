@@ -19,6 +19,7 @@ ce:
   topN: 50
 
 eval:
+  simrna_config: /.../SimRNA/config.dat
   omp_threads: 1
   simrna_iterations: 20000
   simrna_frames: "1-3"
