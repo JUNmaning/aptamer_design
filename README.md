@@ -317,20 +317,21 @@ Expected:
 This is the important part.
 
 Per CE iteration:
-1.Sample ce.batch sequences from current dist.json
-2.Evaluate each sequence by SimRNA + docking
-3.Rank by docking score
-4.Select docking elites using ce.elite_frac
-5.Update CE distribution once from docking elites
-6.Export top rescoring candidates (rescore.topM or rescore.top_frac)
-7.Run MMGBSA on those candidates
-8.Select GBSA elites (rescore.elite_n or rescore.elite_frac)
-9.Update dist.json again using GBSA feedback
-10.Generate the next batch from the updated distribution
+- Sample ce.batch sequences from current dist.json
+- Evaluate each sequence by SimRNA + docking
+- Rank by docking score
+- Select docking elites using ce.elite_frac
+- Update CE distribution once from docking elites
+- Export top rescoring candidates (rescore.topM or rescore.top_frac)
+- Run MMGBSA on those candidates
+- Select GBSA elites (rescore.elite_n or rescore.elite_frac)
+- Update dist.json again using GBSA feedback
+- Generate the next batch from the updated distribution
+
 Therefore:
-1.Docking elites drive the main CE update
-2.MMGBSA elites provide a second, smaller feedback update
-3.topN.csv is only an exported view of best candidates, not the CE update set
+- Docking elites drive the main CE update
+- MMGBSA elites provide a second, smaller feedback update
+- topN.csv is only an exported view of best candidates, not the CE update set
 
 
 ## 7) Common failure modes
