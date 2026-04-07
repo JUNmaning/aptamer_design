@@ -115,7 +115,7 @@ run:
   run_dir: runs/ce_run1
   seed: 123
   log_level: INFO
-  workers: 8
+  workers: 30
 
 inputs:
   ligand: data/PFHxS.sdf
@@ -123,7 +123,7 @@ inputs:
 ce:
   length: 30
   alphabet: RNA
-  batch: 1000
+  batch: 500
   iters: 50
   elite_frac: 0.1
   alpha: 0.4
@@ -132,7 +132,7 @@ ce:
   topN: 50
 
 eval:
-  simrna_config: /.../SimRNA/config.dat
+  simrna_config: /root/autodl-tmp/SimRNA/config.dat
   omp_threads: 1
   simrna_iterations: 20000
   simrna_frames: "1-3"
@@ -150,33 +150,36 @@ eval:
 
 regularize:
   entropy_uniform_mix: 0.02
-  diversity_weight: 0.10
   elite_min_hamming: 0.10
-  elite_diverse: true
+  struct_unique: false
+  struct_metric: bp
+  struct_min_dist: 0.0
 
 monitor:
-  penalty_threshold: 1.0e8
+  penalty_skip:
+    enabled: true
+    frac_thr: 0.95
+    action: skip
+    reset_patience: 2
 
   early_stop:
     enabled: true
     patience: 4
-    min_improve: 0.10
+    min_improve: 0.01
 
   collapse:
     enabled: true
     max_prob: 0.95
     frac_thr: 0.60
-    patience: 3
+    patience: 5
 
   external_stop:
     gbsa_patience: 5
-    gbsa_min_improve: 1.0
-    dock_patience: 6
-    dock_min_improve: 0.10
+    gbsa_min_improve: 0.1
 
 rescore:
   enabled: true
-  top_frac: 0.01
+  top_frac: 0.1
   elite_frac: 0.5
   include_penalty: false
 
