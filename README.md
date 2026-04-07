@@ -472,8 +472,19 @@ Recommended final selection strategy:
 2) check their **vina score**, best_frame, and dock pose quality
 3) keep a small diverse set (avoid near-duplicates)
 
----
 ### 11.3 Molecular Dynamics : `/runs/ce_run1/md`
+Merge topN.csv with all rescore/ter_ */mmgbsa-results.comsv, retaining each seq:
+1) Best (Negative) MMGBSA
+2) The latest MMGBSA
+3) MMGBSA occurrence frequency
+Output two files:
+1) TopN_with_mmgbsa.csv: Maintain the original order of topN.csv
+2) TopN_with_cmgbsa_sorted-by_gbsa.csv: Sort by MMGBSA first
+```bash
+python scripts/merge_topn_with_mmgbsa.py --run_dir runs/ce_run1
+```
+---
+### 11.4 Molecular Dynamics : `/runs/ce_run1/md`
 The final summary results are presented in this document
 - `/runs/ce_run1/md/md_summary.csv`
 Contains information such as ranking, sequence, score, etc
