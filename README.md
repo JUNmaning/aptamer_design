@@ -483,11 +483,13 @@ Output two files:
 ```bash
 python scripts/merge_topn_with_mmgbsa.py --run_dir runs/ce_run1
 ```
----
+
 ### 11.4 Molecular Dynamics : `/runs/ce_run1/md`
 The final summary results are presented in this document
 - `/runs/ce_run1/md/md_summary.csv`
 Contains information such as ranking, sequence, score, etc
+
+---
 
 ## 12) Visualization
 
