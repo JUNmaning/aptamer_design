@@ -177,7 +177,6 @@ monitor:
 rescore:
   enabled: true
   top_frac: 0.01
-  elite_n: 5
   elite_frac: 0.5
   include_penalty: false
 
