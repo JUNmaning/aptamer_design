@@ -176,7 +176,6 @@ monitor:
 
 rescore:
   enabled: true
-  topM: 10
   top_frac: 0.01
   elite_n: 5
   elite_frac: 0.5
@@ -251,11 +250,9 @@ These are used by scripts/run_ce_gbsa_loop.sh.
 
 ### 4.7 `rescore` (MMGBSA rescoring)
 - `enabled`: turn rescoring on/off
-- `topM`: number of candidates selected from `topN.csv` for MMGBSA
 - `include_penalty`: whether penalty candidates are allowed into rescoring (usually false)
-- `top_frac`: if set, overrides topM using a fraction of CE batch
-- `elite_n`: fixed number of MMGBSA elites used in feedback
-- `elite_frac`: if set, overrides elite_n using a fraction of the MMGBSA candidate set
+- `top_frac`: using a fraction of CE batch
+- `elite_frac`: using a fraction of the MMGBSA candidate set
   
 ### 4.8`MD` 
 - `topX`: Set the first X sequences to run MD
