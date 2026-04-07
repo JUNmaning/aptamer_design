@@ -201,70 +201,342 @@ md:
   strip_3prime_phosphate: false
 ```
 
+## Configuration Parameters
+
+The pipeline is controlled by a YAML configuration file. The main sections are described below.
+
+---
+
 ### 4.1 `run`
-- `run_dir`: output folder for all artifacts
-- `seed`: RNG seed (reproducibility)
-- `workers`: parallel evaluation workers
-- `log_level`: logging verbosity
+Controls general run behavior.
+
+- `run_dir`  
+  Output directory for all run artifacts, including logs, checkpoints, history, rescoring results, and optional MD outputs.
+
+- `seed`  
+  Global random seed used for reproducibility.
+
+- `workers`  
+  Number of parallel workers used for sequence evaluation.  
+  Each worker evaluates different sequences independently.
+
+- `log_level`  
+  Logging verbosity, e.g. `INFO`, `DEBUG`, `WARNING`.
+
+- `resume` *(if present in config)*  
+  Whether to resume from an existing checkpoint and cached results.
+
+---
 
 ### 4.2 `inputs`
-- `ligand`: ligand file path (SDF/PDB,It's best to name it 'ligand',The pipeline will first use inputs.ligand if it exists.If not found, some code paths may fall back to data/ligand.sdf or data/ligand.pdb.)
+Defines required input files.
 
-### 4.3 `ce` 
-- `length`: RNA length
-- `batch`: number of sequences sampled/evaluated per CE iteration
-- `iters`: max CE iterations
-- `elite_frac`: fraction of the docking-evaluated batch used as CE elites
-- `alpha`: update step size (aggressiveness)
-- `min_prob`: minimum probability floor
-- `temperature`: sampling temperature
-- `topN`:  number of top candidates exported to topN.csv
-Important:
-topN is only used for exporting/inspection (topN.csv).
-It does not control how many sequences update the CE distribution.
+- `ligand`  
+  Path to the ligand file (`.sdf` or `.pdb`).  
+  It is recommended to provide this explicitly.
 
-The CE distribution is updated using the docking elite set, controlled by elite_frac (or by elite_n if you later add that logic).
+  The pipeline first tries `inputs.ligand`.  
+  If this is missing or invalid, some code paths may fall back to:
+  - `data/ligand.sdf`
+  - `data/ligand.pdb`
+
+---
+
+### 4.3 `ce`
+Controls the Cross-Entropy (CE) optimization loop.
+
+- `length`  
+  RNA sequence length.
+
+- `alphabet`  
+  Sequence alphabet, typically `RNA`.
+
+- `batch`  
+  Number of sequences sampled and evaluated per CE iteration.
+
+- `iters`  
+  Maximum number of CE iterations.
+
+- `elite_frac`  
+  Fraction of the docking-evaluated batch used as CE elites for updating the sequence distribution.
+
+- `alpha`  
+  CE update smoothing factor.  
+  Larger values make updates more aggressive.
+
+- `min_prob`  
+  Minimum probability floor for each nucleotide at each position.
+
+- `temperature`  
+  Sampling temperature for sequence generation.
+
+- `topN`  
+  Number of top candidates exported to `topN.csv`.
+
+**Important:**  
+`topN` is only used for exporting and inspection.  
+It does **not** control how many sequences are used to update the CE distribution.
+
+The CE distribution is updated using the **docking elite set**, controlled by `ce.elite_frac`.
+
+---
 
 ### 4.4 `eval`
-- `simrna_config`: path to SimRNA config file
-- `simrna_iterations`: SimRNA sampling steps (higher = slower)
-- `simrna_frames`: which frames to export (e.g., `"1-3"`)
-- `decoy_agg`:  aggregation method across frames/conformers (min, mean, boltz, p10)
-- `vina_exhaustiveness`, `vina_cpu`, `grid_padding`: docking parameters
-- `ligand_conformers`: how many ligand conformers to generate
-- `ligand_*`: RDKit conformer generation settings
+Controls structure generation and docking evaluation.
 
-### 4.5 `regularize` (avoid collapse / enforce diversity)
-- `entropy_uniform_mix`: mix in uniform distribution to keep entropy
-- `elite_min_hamming`: minimum Hamming distance among elites
-- `elite_diverse`: whether to enforce diversity selection
-- `diversity_weight`: strength of diversity regularization
+- `simrna_config`  
+  Path to the SimRNA configuration file, if required by your environment.
 
-### 4.6 `monitor` (termination criteria)
-- `penalty_threshold`: scores above this are treated as penalties/failures (e.g., 1e9)
-Internal CE stopping
-- `early_stop`: stop if no meaningful improvement for `patience` iterations
-- `collapse`: stop if distribution collapses (max probability too high for too many positions)
-External loop stopping
-- `external_stop.gbsa_*`: stop if MMGBSA best score plateaus
-- `external_stop.dock_*`:  stop if docking best score plateaus
-These are used by scripts/run_ce_gbsa_loop.sh.
+- `omp_threads`  
+  Number of OpenMP threads used in folding-related tools.  
+  When `workers > 1`, this is typically kept at `1` to avoid CPU oversubscription.
 
-### 4.7 `rescore` (MMGBSA rescoring)
-- `enabled`: turn rescoring on/off
-- `include_penalty`: whether penalty candidates are allowed into rescoring (usually false)
-- `top_frac`: using a fraction of CE batch
-- `elite_frac`: using a fraction of the MMGBSA candidate set
-  
-### 4.8`MD` 
-- `topX`: Set the first X sequences to run MD
--  `forcefield`:Set force field type
--  `water`:Set up a water model
--  `box_distance_nm`:Solvent boundary distance
--  `salt_conc_m`:salt concentration
--  `threads`:CPU thread count (0=automatic)
--  `gpu`:Whether to use GPU or not
--  `skip_if_done`:Completed or skipped
+- `simrna_iterations`  
+  Number of SimRNA sampling steps.  
+  Larger values may improve structure sampling but increase runtime.
+
+- `simrna_frames`  
+  Which exported frames are used for docking, e.g. `"1"` or `"1-3"`.
+
+- `decoy_agg`  
+  Aggregation method across multiple frames / decoys / ligand conformers.  
+  Supported values include:
+  - `min`
+  - `mean`
+  - `p10`
+  - `boltz`
+
+- `vina_exhaustiveness`  
+  AutoDock Vina exhaustiveness parameter.
+
+- `vina_cpu`  
+  Number of CPU threads used by each Vina docking task.
+
+- `grid_padding`  
+  Docking box padding in angstroms.
+
+- `ligand_conformers`  
+  Number of ligand conformers to generate before docking.
+
+- `ligand_seed`  
+  Random seed for ligand conformer generation.
+
+- `ligand_prune_rmsd`  
+  RMSD threshold for pruning similar ligand conformers.
+
+- `ligand_forcefield`  
+  Force field used for conformer optimization, e.g. `MMFF`.
+
+- `ligand_optimize`  
+  Whether to optimize generated ligand conformers.
+
+- `ligand_max_opt_iters`  
+  Maximum optimization iterations for ligand conformer refinement.
+
+---
+
+### 4.5 `regularize`
+Controls regularization and diversity preservation during CE updates.
+
+- `entropy_uniform_mix`  
+  Uniform-mixing regularization strength.  
+  A small fraction of the distribution is mixed with a uniform distribution to prevent premature collapse.
+
+- `elite_min_hamming`  
+  Minimum normalized Hamming distance required between selected elite sequences.
+
+- `struct_unique`  
+  If enabled, prevents selecting multiple elites with the same dot-bracket structure.
+
+- `struct_metric`  
+  Structural distance metric used when enforcing structural diversity.  
+  Supported values:
+  - `bp`   : base-pair set distance
+  - `edit` : normalized dot-bracket mismatch
+
+- `struct_min_dist`  
+  Minimum structural distance required between elites.
+
+**Important:**  
+The current code uses:
+- `entropy_uniform_mix`
+- `elite_min_hamming`
+- `struct_unique`
+- `struct_metric`
+- `struct_min_dist`
+
+Parameters such as `elite_diverse` or `diversity_weight` are **not used** unless you explicitly add code to support them.
+
+---
+
+### 4.6 `monitor`
+Controls stopping criteria and stability monitoring.
+
+#### Penalty handling
+- `penalty_skip.enabled`  
+  Whether to skip CE updates when too many sampled sequences fail.
+
+- `penalty_skip.frac_thr`  
+  If the fraction of penalty-scored sequences exceeds this threshold, the CE update is skipped.
+
+- `penalty_skip.action`  
+  Action taken when repeated penalty rounds occur.  
+  Common options:
+  - `skip`
+  - `reset_uniform`
+
+- `penalty_skip.reset_patience`  
+  Number of consecutive high-penalty iterations before resetting to a uniform distribution (if enabled).
+
+#### Internal CE stopping
+- `early_stop.enabled`  
+  Whether to stop the CE loop when improvement stalls.
+
+- `early_stop.patience`  
+  Number of consecutive iterations allowed without sufficient improvement.
+
+- `early_stop.min_improve`  
+  Minimum required improvement in the global best docking score.
+
+#### Collapse detection
+- `collapse.enabled`  
+  Whether to monitor distribution collapse.
+
+- `collapse.max_prob`  
+  Probability threshold used to define a collapsed position.
+
+- `collapse.frac_thr`  
+  Fraction of positions allowed to exceed `max_prob` before collapse is considered significant.
+
+- `collapse.patience`  
+  Number of consecutive collapsed iterations before stopping.
+
+#### External loop stopping
+These parameters are used by the outer CE↔MMGBSA loop script (e.g. `scripts/run_ce_gbsa_loop.sh`).
+
+- `external_stop.gbsa_patience`  
+  Number of MMGBSA iterations checked for GBSA plateau detection.
+
+- `external_stop.gbsa_min_improve`  
+  Minimum MMGBSA improvement required to avoid GBSA plateau stop.
+
+- `external_stop.dock_patience`  
+  Number of iterations checked for docking plateau detection in the external loop.
+
+- `external_stop.dock_min_improve`  
+  Minimum docking improvement required to avoid external docking plateau stop.
+
+**Note:**  
+`early_stop` already monitors docking improvement inside `ce_design.py`.  
+Therefore, `external_stop.dock_*` may overlap with `early_stop`.  
+In many cases, it is sufficient to use:
+- internal `early_stop` for docking
+- external `gbsa_*` for MMGBSA
+
+---
+
+### 4.7 `rescore`
+Controls MMGBSA rescoring and feedback selection.
+
+- `enabled`  
+  Whether rescoring is enabled.
+
+- `include_penalty`  
+  Whether penalty/failure candidates are allowed into rescoring.  
+  Usually set to `false`.
+
+- `topM` *(optional)*  
+  Fixed number of top docking candidates selected for MMGBSA rescoring.
+
+- `top_frac` *(optional)*  
+  Fraction of the CE batch selected for MMGBSA rescoring.
+
+  If `top_frac` is provided, the outer loop script typically computes:
+  `topM = ceil(batch * top_frac)`
+
+- `elite_n` *(optional)*  
+  Fixed number of MMGBSA-rescored candidates used for feedback update.
+
+- `elite_frac` *(optional)*  
+  Fraction of the MMGBSA candidate set used for feedback update.
+
+  If `elite_frac` is provided, the outer loop script typically computes:
+  `elite_n = ceil(topM * elite_frac)`
+
+**Typical logic:**  
+1. CE evaluates a batch with docking  
+2. Top docking candidates are rescored by MMGBSA  
+3. Top MMGBSA candidates are used to guide the next feedback update
+
+---
+
+### 4.8 `md`
+Controls optional post-run MD refinement.
+
+- `enabled`  
+  Whether MD postprocessing is enabled.
+
+- `topX`  
+  Number of top sequences selected for MD simulation.
+
+- `gmx`  
+  GROMACS executable name, e.g. `gmx`.
+
+- `mdp_dir`  
+  Directory containing the required `.mdp` files.
+
+- `forcefield`  
+  Force field used for topology generation.
+
+- `water`  
+  Water model used in GROMACS setup.
+
+- `box_type`  
+  Box shape, e.g. `cubic`.
+
+- `box_distance_nm`  
+  Minimum solute-to-box boundary distance in nm.
+
+- `salt_conc_m`  
+  Salt concentration in mol/L.
+
+- `neutralize`  
+  Whether to neutralize the system.
+
+- `threads`  
+  Number of CPU threads for MD.  
+  `0` usually lets GROMACS decide automatically.
+
+- `gpu`  
+  Whether to enable GPU acceleration for MD runs.
+
+- `skip_if_done`  
+  Skip MD reruns if output files already exist.
+
+- `strip_5prime_phosphate`  
+  Whether to remove 5' phosphate atoms before `pdb2gmx`, which can improve RNA topology generation compatibility.
+
+- `strip_3prime_phosphate`  
+  Whether to remove 3' phosphate atoms before `pdb2gmx`.
+
+---
+
+## Practical Notes
+
+- `topN.csv` stores the top docking candidates only.  
+  It does not automatically contain MMGBSA results.
+
+- MMGBSA results are written under:
+  `run_dir/rescore/iter_*/mmgbsa_results.csv`
+
+- If you use an outer CE↔MMGBSA loop, the effective rescoring size is typically controlled by:
+  - `rescore.top_frac`
+  - `rescore.elite_frac`
+
+- If both `early_stop` and `external_stop.dock_*` are enabled, docking plateau may be monitored twice.
+
+- Some YAML keys may look reasonable but are not actually consumed unless the code explicitly reads them. Always check the implementation if you add new parameters.
+
 ---
 
 ## 5) Smoke test (verify multi-frame + multi-conformer + aggregation)
