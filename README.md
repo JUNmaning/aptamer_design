@@ -2,10 +2,28 @@
 
 Author: maning
 
-This repository implements an end-to-end, reproducible RNA aptamer design pipeline driven by a Cross-Entropy (CE) optimizer.  
+This repository implements an end-to-end, reproducible RNA aptamer design pipeline driven by a Cross-Entropy (CE) optimizer.
 At each CE iteration, the pipeline samples RNA sequences from a probability distribution, evaluates them via RNA structure sampling (SimRNA) and docking (AutoDock Vina) using multiple RNA decoy frames and multiple ligand conformers, then optionally runs MMGBSA rescoring on top candidates and feeds those scores back to update the CE distribution for the next iteration.
 
 The workflow is restartable/resumable and supports cheap smoke tests before expensive rescoring.
+
+---
+
+## Table of Contents
+
+1. [What this pipeline does](#1-what-this-pipeline-does)
+2. [Key outputs](#2-key-outputs-per-run-directory)
+3. [Environment and dependencies](#3-environment-and-dependencies)
+4. [Ligand charge handling (IMPORTANT)](#4-ligand-charge-handling-important)
+5. [How to run (production)](#5-how-to-run-production)
+6. [Quick Start (5-minute test)](#6-quick-start-5-minute-test)
+7. [Configuration explained](#7-configuration-explained)
+8. [Smoke test](#8-smoke-test)
+9. [How to analyze results](#9-how-to-analyze-results)
+10. [Common failure modes](#10-common-failure-modes)
+11. [Visualization](#11-visualization)
+12. [CE theory mapping](#12-ce-theory-mapping)
+13. [Reproducibility notes](#13-reproducibility-notes)
 
 ---
 
@@ -13,751 +31,588 @@ The workflow is restartable/resumable and supports cheap smoke tests before expe
 
 Given a ligand structure (SDF/PDB), the pipeline performs:
 
-1. Ligand ensemble generation (RDKit conformers)
+1. Ligand ensemble generation (RDKit conformers with charge validation)
 2. RNA structure sampling (ViennaRNA + SimRNA trajectory)
-3. Multi-frame decoy export (SimRNA `.trafl` → multiple all-atom PDBs)
-4. Docking (Vina) across RNA frames × ligand conformers
-5. Aggregation across frames/conformers (e.g. `min`)
+3. Multi-frame decoy export (SimRNA trafl to multiple all-atom PDBs)
+4. Docking (Vina) across RNA frames x ligand conformers
+5. Aggregation across frames/conformers (e.g. min)
 6. CE update using docking elites
 7. Optional MMGBSA rescoring for top candidates
-8. Feedback update: MMGBSA results update `dist.json`
+8. Feedback update: MMGBSA results update dist.json
 9. Resume to the next CE iteration until stopping criteria are met
 
 ---
 
 ## 2) Key outputs (per run directory)
 
-A run directory (e.g. `runs/ce_run1/`) contains:
+A run directory (e.g. runs/ce_run1/) contains:
 
-```
-runs/<RUN_NAME>/
-├── config_resolved.json          # resolved configuration for reproducibility
-├── meta.json                     # run metadata
-├── logs/ce_design.log            # main log
-├── checkpoint.json               # resume/stop state
-├── dist.json                     # CE distribution (core state)
-├── history.csv                   # per-iteration summary metrics
-├── topN.csv                      # exported top ranked candidates (for inspection)
-├── next_batch.txt                # next batch generated after GBSA feedback
-├── ligand_ensemble/              # ligand conformers + manifest
-├── fold/<eval_hash>/             # SimRNA outputs per sequence
-│   ├── aptamer.trafl
-│   ├── aptamer-000001_AA.pdb
-│   ├── aptamer-000002_AA.pdb
-│   └── ...
-├── dock/<eval_hash>/frame_XXX/
-│   └── lig_YYY/
-│       ├── *.dock.pdbqt
-│       ├── *.vina.log
-│       └── ...
-├── rescore/iter_XXX/
-│   ├── manifest.jsonl            # candidates selected for MMGBSA
-│   ├── mmgbsa_results.csv        # raw MMGBSA results
-│   ├── mmgbsa_results.jsonl
-│   ├── results.csv               # normalized file for GBSA feedback
-│   ├── elites_for_ce.txt         # elites selected in GBSA feedback
-│   └── feedback.done             # marker file for completed feedback
-└── md/                           # optional MD results
-    ├── rank_00x_<eval_hash>/
-    └── md_summary.csv
-```
+    runs/<RUN_NAME>/
+    ├── config_resolved.json          # resolved configuration for reproducibility
+    ├── meta.json                     # run metadata
+    ├── logs/ce_design.log            # main log
+    ├── checkpoint.json               # resume/stop state
+    ├── dist.json                     # CE distribution (core state)
+    ├── history.csv                   # per-iteration summary metrics
+    ├── topN.csv                      # exported top ranked candidates
+    ├── next_batch.txt                # next batch generated after GBSA feedback
+    ├── ligand_ensemble/              # ligand conformers + charge info
+    │   ├── manifest.json             # includes charge_info
+    │   ├── charge.json               # standalone charge information
+    │   ├── charge.txt                # simple charge value (e.g. -1)
+    │   └── conf_*.sdf               # individual conformers with NET_CHARGE property
+    ├── fold/<eval_hash>/             # SimRNA outputs per sequence
+    │   ├── aptamer.trafl
+    │   ├── aptamer-000001_AA.pdb
+    │   └── ...
+    ├── dock/<eval_hash>/frame_XXX/lig_YYY/
+    │   ├── *.dock.pdbqt
+    │   └── *.vina.log
+    ├── rescore/iter_XXX/
+    │   ├── manifest.jsonl            # candidates selected for MMGBSA
+    │   ├── mmgbsa_results.csv        # raw MMGBSA results
+    │   ├── results.csv               # normalized file for GBSA feedback
+    │   ├── elites_for_ce.txt         # elites selected in GBSA feedback
+    │   └── feedback.done             # marker for completed feedback
+    └── md/                           # optional MD results
+        ├── rank_00x_<eval_hash>/
+        └── md_summary.csv
+
+### File purpose summary
+
+| File | Purpose | When to inspect |
+|------|---------|----------------|
+| dist.json | CE distribution state | Debug convergence issues |
+| checkpoint.json | Resume state | Check current iteration |
+| history.csv | Per-iteration metrics | Monitor training progress |
+| topN.csv | Best docking candidates | Quick result inspection |
+| cache.jsonl | Evaluation cache | Debug duplicate evaluations |
+| next_batch.txt | Next sequences to evaluate | After GBSA feedback |
+| ligand_ensemble/manifest.json | Ligand conformers + charge info | Verify charge detection |
+| ligand_ensemble/charge.txt | Net charge (simple) | Quick charge check |
+| rescore/iter_XXX/mmgbsa_results.csv | MMGBSA outputs | Final ranking |
+| rescore/iter_XXX/elites_for_ce.txt | GBSA feedback elites | Verify feedback update |
+| md/md_summary.csv | MD results summary | Post-run refinement |
 
 Two files matter most for the feedback loop:
-- `dist.json`: current CE distribution (updated each iteration)
-- `checkpoint.json`: current iteration/termination state (controls resume)
+- dist.json: current CE distribution (updated each iteration)
+- checkpoint.json: current iteration/termination state (controls resume)
 
 ---
 
-## 3) Environment & dependencies
+## 3) Environment and dependencies
 
 ### 3.1 Recommended: mamba
 
-This project includes an `environment.yml`.
+This project includes an environment.yml.
 
-```bash
-micromamba create -f environment.yml -y
-micromamba shell init -s bash -r /root/.local/share/mamba
-source ~/.bashrc
-micromamba activate aptamer_design
-```
+    micromamba create -f environment.yml -y
+    micromamba shell init -s bash -r /root/.local/share/mamba
+    source ~/.bashrc
+    micromamba activate aptamer_design
 
-### 3.2 External tools required on your machine
+### 3.2 External tools required
 
-The pipeline assumes these tools are available in `PATH` (or configured by absolute path in code/config):
+The pipeline assumes these tools are available in PATH:
 
-- SimRNA (including `SimRNA` and `SimRNA_trafl2pdbs`)
-- AutoDock Vina (`vina`)
-- MMGBSA toolchain (AmberTools / `MMPBSA.py` or your MMGBSA implementation)
+- SimRNA (including SimRNA and SimRNA_trafl2pdbs)
+- AutoDock Vina (vina)
+- AmberTools (tleap, antechamber, parmchk2, MMPBSA.py)
 - OpenBabel (obabel)
 - ViennaRNA (RNAfold)
 - Optional MD: GROMACS (gmx)
 
 Quick check:
 
-```bash
-which RNAfold || echo "RNAfold not found"
-which SimRNA || echo "SimRNA not found"
-which SimRNA_trafl2pdbs || echo "SimRNA_trafl2pdbs not found"
-which obabel || echo "obabel not found"
-which vina || echo "vina not found"
-which tleap || echo "tleap not found"
-which MMPBSA.py || echo "MMPBSA.py not found"
-```
+    which RNAfold || echo "RNAfold not found"
+    which SimRNA || echo "SimRNA not found"
+    which SimRNA_trafl2pdbs || echo "SimRNA_trafl2pdbs not found"
+    which obabel || echo "obabel not found"
+    which vina || echo "vina not found"
+    which tleap || echo "tleap not found"
+    which MMPBSA.py || echo "MMPBSA.py not found"
+
+### 3.3 Preflight check
+
+    bash scripts/preflight.sh
 
 ---
 
-## 4) Configuration explained (`run_default.yaml`)
+## 4) Ligand charge handling (IMPORTANT)
 
-Example config:
+### Why charge matters
 
-```yaml
-run:
-  run_dir: runs/ce_run1
-  seed: 123
-  log_level: INFO
-  workers: 30
+Ligand charge critically affects:
+- Antechamber parameterization (AM1-BCC charge assignment)
+- MMGBSA binding free energy (electrostatics dominate)
+- Docking pose selection (charged groups prefer polar pockets)
 
-inputs:
-  ligand: data/PFHxS.sdf
+Wrong charge will cause all MMGBSA calculations to fail or give meaningless results.
 
-ce:
-  length: 30
-  alphabet: RNA
-  batch: 500
-  iters: 50
-  elite_frac: 0.1
-  alpha: 0.4
-  min_prob: 0.02
-  temperature: 1.0
-  topN: 50
+### Automatic charge detection (priority order)
 
-eval:
-  simrna_config: /root/autodl-tmp/SimRNA/config.dat
-  omp_threads: 1
-  simrna_iterations: 20000
-  simrna_frames: "1-3"
-  decoy_agg: "min"
-  vina_exhaustiveness: 8
-  vina_cpu: 1
-  grid_padding: 8.0
+The pipeline auto-detects ligand charge from:
 
-  ligand_conformers: 2
-  ligand_seed: 123
-  ligand_prune_rmsd: 0.5
-  ligand_forcefield: "MMFF"
-  ligand_optimize: true
-  ligand_max_opt_iters: 200
+1. CLI override (--charge in ligand prep, or --net_charge in MMGBSA)
+2. ligand_ensemble/manifest.json (charge_info.formal_charge) -- most reliable
+3. ligand_ensemble/charge.json (standalone charge info)
+4. ligand_ensemble/charge.txt (simple text file)
+5. SDF NET_CHARGE property (embedded in conformer SDF files)
+6. RDKit formal charge from original ligand file
+7. PDBQT Gasteiger sum (last resort, unreliable)
+8. Fallback to 0 (with warning)
 
-regularize:
-  entropy_uniform_mix: 0.02
-  elite_min_hamming: 0.10
-  struct_unique: false
-  struct_metric: bp
-  struct_min_dist: 0.0
+### How to check your ligand charge
 
-monitor:
-  penalty_skip:
-    enabled: true
-    frac_thr: 0.95
-    action: skip
-    reset_patience: 2
+    python ligand/rdkit_conformers.py data/your_ligand.sdf --charge_only
 
-  early_stop:
-    enabled: true
-    patience: 4
-    min_improve: 0.01
+Example output:
 
-  collapse:
-    enabled: true
-    max_prob: 0.95
-    frac_thr: 0.60
-    patience: 5
+    Formal charge:    0
+    Detection method: rdkit_formal
+    Validation:       PASSED
+    Formula:          C6H2F13O3P
+    MW:               400.03
 
-  external_stop:
-    gbsa_patience: 5
-    gbsa_min_improve: 0.1
+### Common ligand charge values at pH 7.4
 
-rescore:
-  enabled: true
-  top_frac: 0.1
-  elite_frac: 0.5
-  include_penalty: false
+- Phosphoric acid (-PO(OH)2): charge = -1 or -2
+- ATP: charge = -3 or -4
+- Neutral ligands: charge = 0
+- Amines: charge = +1
 
-md:
-  enabled: false
-  topX: 10
-  gmx: gmx
-  mdp_dir: mdp
-  forcefield: amber99sb-ildn
-  water: tip3p
-  box_type: cubic
-  box_distance_nm: 1.0
-  salt_conc_m: 0.15
-  neutralize: true
-  threads: 0
-  gpu: false
-  skip_if_done: true
-  strip_5prime_phosphate: true
-  strip_3prime_phosphate: false
-```
+### How to set ligand charge
 
-## Configuration Parameters
+Before running the main pipeline, prepare ligand conformers with the correct charge:
 
-The pipeline is controlled by a YAML configuration file. The main sections are described below.
+    cd ~/autodl-tmp/aptamer_design
+
+    python ligand/rdkit_conformers.py data/PFHxS.sdf \
+        --out_dir runs/ce_run1/ligand_ensemble \
+        --n_confs 10 \
+        --charge -1
+
+    # Verify:
+    cat runs/ce_run1/ligand_ensemble/charge.txt
+    # Should output: -1
+
+This charge will be automatically used by all downstream steps including
+CE docking evaluation, MMGBSA rescoring, and all analysis.
+
+### Override charge during MMGBSA only
+
+If you need to re-run MMGBSA with a different charge without regenerating conformers:
+
+    python -m experiments.rescore_mmgbsa \
+        --run_dir runs/ce_run1 \
+        --iter 1 \
+        --net_charge -2
 
 ---
 
-### 4.1 `run`
-Controls general run behavior.
+## 5) How to run (production)
 
-- `run_dir`  
-  Output directory for all run artifacts, including logs, checkpoints, history, rescoring results, and optional MD outputs.
+### Standard workflow (recommended)
 
-- `seed`  
-  Global random seed used for reproducibility.
+    cd ~/autodl-tmp/aptamer_design
 
-- `workers`  
-  Number of parallel workers used for sequence evaluation.  
-  Each worker evaluates different sequences independently.
+    # Step 1: Prepare ligand ensemble with correct charge
+    python ligand/rdkit_conformers.py data/PFHxS.sdf \
+        --out_dir runs/ce_run1/ligand_ensemble \
+        --n_confs 10 \
+        --charge -1
 
-- `log_level`  
-  Logging verbosity, e.g. `INFO`, `DEBUG`, `WARNING`.
+    # Step 2: Verify charge
+    cat runs/ce_run1/ligand_ensemble/charge.txt
 
-- `resume` *(if present in config)*  
-  Whether to resume from an existing checkpoint and cached results.
+    # Step 3: Run the full CE + GBSA feedback loop
+    bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
 
----
+### One-line command (charge + run)
 
-### 4.2 `inputs`
-Defines required input files.
+    python ligand/rdkit_conformers.py data/PFHxS.sdf \
+        --out_dir runs/ce_run1/ligand_ensemble \
+        --n_confs 10 \
+        --charge -1 && \
+    bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
 
-- `ligand`  
-  Path to the ligand file (`.sdf` or `.pdb`).  
-  It is recommended to provide this explicitly.
+### What the loop does
 
-  The pipeline first tries `inputs.ligand`.  
-  If this is missing or invalid, some code paths may fall back to:
-  - `data/ligand.sdf`
-  - `data/ligand.pdb`
+The run_ce_gbsa_loop.sh script will:
 
----
+1. Read checkpoint.json to determine the last completed iteration
+2. Run CE to iter_completed + 1
+3. Run MMGBSA rescoring for that iteration (auto-detects charge from ligand_ensemble/)
+4. Run GBSA feedback to update dist.json (only uses mmgbsa_ok=True entries)
+5. Repeat until:
+   - ce.iters reached, OR
+   - stop_reason in checkpoint.json becomes non-empty
 
-### 4.3 `ce`
-Controls the Cross-Entropy (CE) optimization loop.
+### Resume after interruption
 
-- `length`  
-  RNA sequence length.
+Just re-run the same command:
 
-- `alphabet`  
-  Sequence alphabet, typically `RNA`.
+    bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
 
-- `batch`  
-  Number of sequences sampled and evaluated per CE iteration.
+The loop will:
+1. Read checkpoint.json to find the last completed iteration
+2. Skip iterations where feedback.done exists
+3. Continue from the next incomplete iteration
 
-- `iters`  
-  Maximum number of CE iterations.
+### Restart from scratch
 
-- `elite_frac`  
-  Fraction of the docking-evaluated batch used as CE elites for updating the sequence distribution.
+    rm -rf runs/ce_run1
+    # Then re-run from Step 1
 
-- `alpha`  
-  CE update smoothing factor.  
-  Larger values make updates more aggressive.
+### Update ligand charge for an existing run
 
-- `min_prob`  
-  Minimum probability floor for each nucleotide at each position.
+If you already ran some iterations and want to change the charge:
 
-- `temperature`  
-  Sampling temperature for sequence generation.
+    cd ~/autodl-tmp/aptamer_design
 
-- `topN`  
-  Number of top candidates exported to `topN.csv`.
+    # 1. Update ligand ensemble
+    python ligand/rdkit_conformers.py data/PFHxS.sdf \
+        --out_dir runs/ce_run1/ligand_ensemble \
+        --n_confs 10 \
+        --charge -1
 
-**Important:**  
-`topN` is only used for exporting and inspection.  
-It does **not** control how many sequences are used to update the CE distribution.
+    # 2. Clear current iteration MMGBSA results
+    rm -rf runs/ce_run1/rescore/iter_001/mmgbsa
+    rm -f runs/ce_run1/rescore/iter_001/mmgbsa_results.*
+    rm -f runs/ce_run1/rescore/iter_001/feedback.done
 
-The CE distribution is updated using the **docking elite set**, controlled by `ce.elite_frac`.
+    # 3. Continue
+    bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
 
----
+### Stopping criteria (automatic)
 
-### 4.4 `eval`
-Controls structure generation and docking evaluation.
+The loop stops when any of these conditions is met:
 
-- `simrna_config`  
-  Path to the SimRNA configuration file, if required by your environment.
+1. ce.iters reached (e.g. 50 iterations)
+2. monitor.early_stop triggered (docking plateau)
+3. monitor.collapse triggered (distribution collapsed)
+4. External GBSA plateau (monitor.external_stop.gbsa_patience)
 
-- `omp_threads`  
-  Number of OpenMP threads used in folding-related tools.  
-  When `workers > 1`, this is typically kept at `1` to avoid CPU oversubscription.
+Check which criterion stopped the run:
 
-- `simrna_iterations`  
-  Number of SimRNA sampling steps.  
-  Larger values may improve structure sampling but increase runtime.
-
-- `simrna_frames`  
-  Which exported frames are used for docking, e.g. `"1"` or `"1-3"`.
-
-- `decoy_agg`  
-  Aggregation method across multiple frames / decoys / ligand conformers.  
-  Supported values include:
-  - `min`
-  - `mean`
-  - `p10`
-  - `boltz`
-
-- `vina_exhaustiveness`  
-  AutoDock Vina exhaustiveness parameter.
-
-- `vina_cpu`  
-  Number of CPU threads used by each Vina docking task.
-
-- `grid_padding`  
-  Docking box padding in angstroms.
-
-- `ligand_conformers`  
-  Number of ligand conformers to generate before docking.
-
-- `ligand_seed`  
-  Random seed for ligand conformer generation.
-
-- `ligand_prune_rmsd`  
-  RMSD threshold for pruning similar ligand conformers.
-
-- `ligand_forcefield`  
-  Force field used for conformer optimization, e.g. `MMFF`.
-
-- `ligand_optimize`  
-  Whether to optimize generated ligand conformers.
-
-- `ligand_max_opt_iters`  
-  Maximum optimization iterations for ligand conformer refinement.
+    cat runs/ce_run1/checkpoint.json
 
 ---
 
-### 4.5 `regularize`
-Controls regularization and diversity preservation during CE updates.
+## 6) Quick Start (5-minute test)
 
-- `entropy_uniform_mix`  
-  Uniform-mixing regularization strength.  
-  A small fraction of the distribution is mixed with a uniform distribution to prevent premature collapse.
+    cd ~/autodl-tmp/aptamer_design
 
-- `elite_min_hamming`  
-  Minimum normalized Hamming distance required between selected elite sequences.
+    # 1. Prepare ligand
+    python ligand/rdkit_conformers.py data/PFHxS.sdf \
+        --out_dir runs/test/ligand_ensemble \
+        --n_confs 2 \
+        --charge -1
 
-- `struct_unique`  
-  If enabled, prevents selecting multiple elites with the same dot-bracket structure.
+    # 2. Create minimal config
+    cat > configs/test.yaml <<EOF
+    run:
+      run_dir: runs/test
+      seed: 123
+      workers: 1
 
-- `struct_metric`  
-  Structural distance metric used when enforcing structural diversity.  
-  Supported values:
-  - `bp`   : base-pair set distance
-  - `edit` : normalized dot-bracket mismatch
+    inputs:
+      ligand: data/PFHxS.sdf
 
-- `struct_min_dist`  
-  Minimum structural distance required between elites.
+    ce:
+      length: 30
+      batch: 2
+      iters: 1
+      elite_frac: 0.5
 
-**Important:**  
-The current code uses:
-- `entropy_uniform_mix`
-- `elite_min_hamming`
-- `struct_unique`
-- `struct_metric`
-- `struct_min_dist`
+    eval:
+      simrna_iterations: 5000
+      simrna_frames: "1"
+      ligand_conformers: 2
+      vina_exhaustiveness: 2
 
-Parameters such as `elite_diverse` or `diversity_weight` are **not used** unless you explicitly add code to support them.
+    rescore:
+      enabled: false
+    EOF
+
+    # 3. Run
+    python -m experiments.ce_design --config configs/test.yaml
+
+    # 4. Check
+    head -n 5 runs/test/topN.csv
 
 ---
 
-### 4.6 `monitor`
-Controls stopping criteria and stability monitoring.
+## 7) Configuration explained
+
+### 7.1 run
+- run_dir: Output directory for all run artifacts
+- seed: Global random seed for reproducibility
+- workers: Number of parallel workers for sequence evaluation
+- log_level: Logging verbosity (INFO, DEBUG, WARNING)
+- resume: Whether to resume from existing checkpoint
+
+### 7.2 inputs
+- ligand: Path to ligand file (.sdf or .pdb)
+
+### 7.3 ce
+- length: RNA sequence length
+- alphabet: Sequence alphabet (RNA)
+- batch: Number of sequences sampled per CE iteration
+- iters: Maximum number of CE iterations
+- elite_frac: Fraction of batch used as CE elites
+- alpha: CE update smoothing factor
+- min_prob: Minimum probability floor per position
+- temperature: Sampling temperature
+- topN: Number of top candidates exported to topN.csv (for inspection only)
+
+### 7.4 eval
+- simrna_config: Path to SimRNA configuration file
+- omp_threads: OpenMP threads for folding (keep 1 when workers > 1)
+- simrna_iterations: Number of SimRNA sampling steps
+- simrna_frames: Which frames to export (e.g. "1" or "1-3")
+- decoy_agg: Aggregation method (min, mean, p10, boltz)
+- vina_exhaustiveness: Vina exhaustiveness parameter
+- vina_cpu: CPU threads per Vina task
+- grid_padding: Docking box padding in angstroms
+- ligand_conformers: Number of ligand conformers to generate
+- ligand_seed: Random seed for conformer generation
+- ligand_prune_rmsd: RMSD threshold for pruning conformers
+- ligand_forcefield: Force field for optimization (MMFF or UFF)
+- ligand_optimize: Whether to optimize conformers
+- ligand_max_opt_iters: Maximum optimization iterations
+
+### 7.5 regularize
+- entropy_uniform_mix: Uniform-mixing regularization strength
+- elite_min_hamming: Minimum Hamming distance between elites
+- struct_unique: Prevent duplicate dot-bracket structures
+- struct_metric: Structural distance metric (bp or edit)
+- struct_min_dist: Minimum structural distance between elites
+
+### 7.6 monitor
 
 #### Penalty handling
-- `penalty_skip.enabled`  
-  Whether to skip CE updates when too many sampled sequences fail.
+- penalty_skip.enabled: Skip CE updates when too many sequences fail
+- penalty_skip.frac_thr: Penalty fraction threshold
+- penalty_skip.action: Action on repeated penalties (skip or reset_uniform)
+- penalty_skip.reset_patience: Iterations before reset
 
-- `penalty_skip.frac_thr`  
-  If the fraction of penalty-scored sequences exceeds this threshold, the CE update is skipped.
-
-- `penalty_skip.action`  
-  Action taken when repeated penalty rounds occur.  
-  Common options:
-  - `skip`
-  - `reset_uniform`
-
-- `penalty_skip.reset_patience`  
-  Number of consecutive high-penalty iterations before resetting to a uniform distribution (if enabled).
-
-#### Internal CE stopping
-- `early_stop.enabled`  
-  Whether to stop the CE loop when improvement stalls.
-
-- `early_stop.patience`  
-  Number of consecutive iterations allowed without sufficient improvement.
-
-- `early_stop.min_improve`  
-  Minimum required improvement in the global best docking score.
+#### Early stopping
+- early_stop.enabled: Stop when improvement stalls
+- early_stop.patience: Consecutive iterations without improvement
+- early_stop.min_improve: Minimum required improvement
 
 #### Collapse detection
-- `collapse.enabled`  
-  Whether to monitor distribution collapse.
-
-- `collapse.max_prob`  
-  Probability threshold used to define a collapsed position.
-
-- `collapse.frac_thr`  
-  Fraction of positions allowed to exceed `max_prob` before collapse is considered significant.
-
-- `collapse.patience`  
-  Number of consecutive collapsed iterations before stopping.
+- collapse.enabled: Monitor distribution collapse
+- collapse.max_prob: Probability threshold for collapsed position
+- collapse.frac_thr: Fraction of positions exceeding threshold
+- collapse.patience: Iterations before stopping
 
 #### External loop stopping
-These parameters are used by the outer CE↔MMGBSA loop script (e.g. `scripts/run_ce_gbsa_loop.sh`).
+- external_stop.gbsa_patience: GBSA plateau detection window
+- external_stop.gbsa_min_improve: Minimum GBSA improvement
+- external_stop.dock_patience: Docking plateau window
+- external_stop.dock_min_improve: Minimum docking improvement
 
-- `external_stop.gbsa_patience`  
-  Number of MMGBSA iterations checked for GBSA plateau detection.
+### 7.7 rescore
+- enabled: Whether MMGBSA rescoring is enabled
+- top_frac: Fraction of batch selected for rescoring
+- elite_frac: Fraction of rescored candidates used for feedback
+- include_penalty: Allow penalty candidates into rescoring
 
-- `external_stop.gbsa_min_improve`  
-  Minimum MMGBSA improvement required to avoid GBSA plateau stop.
-
-- `external_stop.dock_patience`  
-  Number of iterations checked for docking plateau detection in the external loop.
-
-- `external_stop.dock_min_improve`  
-  Minimum docking improvement required to avoid external docking plateau stop.
-
-**Note:**  
-`early_stop` already monitors docking improvement inside `ce_design.py`.  
-Therefore, `external_stop.dock_*` may overlap with `early_stop`.  
-In many cases, it is sufficient to use:
-- internal `early_stop` for docking
-- external `gbsa_*` for MMGBSA
-
----
-
-### 4.7 `rescore`
-Controls MMGBSA rescoring and feedback selection.
-
-- `enabled`  
-  Whether rescoring is enabled.
-
-- `include_penalty`  
-  Whether penalty/failure candidates are allowed into rescoring.  
-  Usually set to `false`.
-
-- `top_frac` *(optional)*  
-  Fraction of the CE batch selected for MMGBSA rescoring.
-
-- `elite_frac` *(optional)*  
-  Fraction of the MMGBSA candidate set used for feedback update.
-
-**Typical logic:**  
-1. CE evaluates a batch with docking  
-2. Top docking candidates are rescored by MMGBSA  
-3. Top MMGBSA candidates are used to guide the next feedback update
+### 7.8 md
+- enabled: Whether MD postprocessing is enabled
+- topX: Number of top sequences for MD
+- gmx: GROMACS executable name
+- mdp_dir: Directory containing .mdp files
+- forcefield: Force field for topology generation
+- water: Water model
+- box_type: Box shape (cubic)
+- box_distance_nm: Solute-to-box boundary distance
+- salt_conc_m: Salt concentration (mol/L)
+- neutralize: Whether to neutralize the system
+- threads: CPU threads for MD (0 = auto)
+- gpu: Enable GPU acceleration
+- skip_if_done: Skip if output files exist
+- strip_5prime_phosphate: Remove 5' phosphate before pdb2gmx
+- strip_3prime_phosphate: Remove 3' phosphate before pdb2gmx
 
 ---
 
-### 4.8 `md`
-Controls optional post-run MD refinement.
+## 8) Smoke test
 
-- `enabled`  
-  Whether MD postprocessing is enabled.
+Before running expensive rescoring, do a cheap smoke test:
 
-- `topX`  
-  Number of top sequences selected for MD simulation.
-
-- `gmx`  
-  GROMACS executable name, e.g. `gmx`.
-
-- `mdp_dir`  
-  Directory containing the required `.mdp` files.
-
-- `forcefield`  
-  Force field used for topology generation.
-
-- `water`  
-  Water model used in GROMACS setup.
-
-- `box_type`  
-  Box shape, e.g. `cubic`.
-
-- `box_distance_nm`  
-  Minimum solute-to-box boundary distance in nm.
-
-- `salt_conc_m`  
-  Salt concentration in mol/L.
-
-- `neutralize`  
-  Whether to neutralize the system.
-
-- `threads`  
-  Number of CPU threads for MD.  
-  `0` usually lets GROMACS decide automatically.
-
-- `gpu`  
-  Whether to enable GPU acceleration for MD runs.
-
-- `skip_if_done`  
-  Skip MD reruns if output files already exist.
-
-- `strip_5prime_phosphate`  
-  Whether to remove 5' phosphate atoms before `pdb2gmx`, which can improve RNA topology generation compatibility.
-
-- `strip_3prime_phosphate`  
-  Whether to remove 3' phosphate atoms before `pdb2gmx`.
-
----
-
-## Practical Notes
-
-- `topN.csv` stores the top docking candidates only.  
-  It does not automatically contain MMGBSA results.
-
-- MMGBSA results are written under:
-  `run_dir/rescore/iter_*/mmgbsa_results.csv`
-
-- If you use an outer CE↔MMGBSA loop, the effective rescoring size is typically controlled by:
-  - `rescore.top_frac`
-  - `rescore.elite_frac`
-
-- If both `early_stop` and `external_stop.dock_*` are enabled, docking plateau may be monitored twice.
-
-- Some YAML keys may look reasonable but are not actually consumed unless the code explicitly reads them. Always check the implementation if you add new parameters.
-
----
-
-## 5) Smoke test (verify multi-frame + multi-conformer + aggregation)
-
-Before running expensive rescoring, do a cheap smoke test by reducing parameters:
-- `ce.iters: 1`
-- `ce.batch: 2-4`
-- `simrna_frames: "1-2"`
-- `ligand_conformers: 2-3`
-- `vina_exhaustiveness: 2`
-
-Run:
-
-```bash
-python -m experiments.ce_design --config configs/report_smoke.yaml 2>&1 | tee /tmp/report_smoke.log
-```
+    python -m experiments.ce_design --config configs/report_smoke.yaml 2>&1 | tee /tmp/report_smoke.log
 
 Validate multi-frame export:
 
-```bash
-RUN=runs/report_smok
-HASH=$(ls "$RUN/fold" | head -n 1)
+    RUN=runs/report_smoke
+    HASH=$(ls "$RUN/fold" | head -n 1)
 
-python - <<PY
-from pathlib import Path
-p=Path("$RUN/fold/$HASH/aptamer.trafl")
-n=0
-for line in p.read_text(errors="ignore").splitlines():
-    if len(line.split())==5:
-        n+=1
-print("frames_in_trafl =", n)
-PY
+    python - <<PY
+    from pathlib import Path
+    p = Path("$RUN/fold/$HASH/aptamer.trafl")
+    n = sum(1 for line in p.read_text(errors="ignore").splitlines() if len(line.split()) == 5)
+    print("frames_in_trafl =", n)
+    PY
 
-ls -lh "$RUN/fold/$HASH/"*_AA.pdb
-ls -1 "$RUN/dock/$HASH" | sed -n '1,20p'
-head -n 5 "$RUN/topN.csv"
-```
+    ls -lh "$RUN/fold/$HASH/"*_AA.pdb
+    ls -1 "$RUN/dock/$HASH" | head -10
+    head -n 5 "$RUN/topN.csv"
 
 Expected:
-- `frames_in_trafl >= 2`
-- at least two files: `aptamer-000001_AA.pdb` and `aptamer-000002_AA.pdb`
-- docking folder includes `frame_001` and `frame_002`
-- `topN.csv` contains `n_frames >= 2`
+- frames_in_trafl >= 2
+- At least two PDB files exported
+- Docking folder includes frame_001 and frame_002
+- topN.csv contains n_frames >= 2
 
 ---
 
-## 6) How to analyze results 
+## 9) How to analyze results
 
-This is the important part.
+### 9.1 Workflow overview
 
-Per CE iteration:
-- Sample ce.batch sequences from current dist.json
-- Evaluate each sequence by SimRNA + docking
-- Rank by docking score
-- Select docking elites using ce.elite_frac
-- Update CE distribution once from docking elites
-- Export top rescoring candidates (rescore.topM or rescore.top_frac)
-- Run MMGBSA on those candidates
-- Select GBSA elites (rescore.elite_n or rescore.elite_frac)
-- Update dist.json again using GBSA feedback
-- Generate the next batch from the updated distribution
+Inner loop (within each CE iteration):
+1. Sample ce.batch sequences from current dist.json
+2. Evaluate: SimRNA -> dock each frame x conformer -> aggregate
+3. Rank by docking score
+4. Select docking elites using ce.elite_frac
+5. Update dist.json from docking elites
 
-Therefore:
-- Docking elites drive the main CE update
-- MMGBSA elites provide a second, smaller feedback update
-- topN.csv is only an exported view of best candidates, not the CE update set
+Outer loop (MMGBSA feedback):
+1. Export top candidates for rescoring
+2. Run MMGBSA on selected candidates
+3. Filter by mmgbsa_ok=True (exclude failed calculations)
+4. Select GBSA elites
+5. Update dist.json again using GBSA feedback
+6. Generate next batch from updated distribution
 
+### 9.2 Vina results: topN.csv
 
-## 7) Common failure modes
+    head -n 10 runs/ce_run1/topN.csv
 
-### 7.1 All scores are 1e9 (penalty)
+### 9.3 MMGBSA results: rescore/iter_XXX/mmgbsa_results.csv
 
-Usually means fold/dock failed.
+    python -c "
+    import pandas as pd
+    df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
+    n_ok = df['mmgbsa_ok'].astype(str).str.lower().isin(['true','1']).sum()
+    print(f'MMGBSA success: {n_ok}/{len(df)}')
+    if n_ok > 0:
+        ok = df[df['mmgbsa_ok'].astype(str).str.lower().isin(['true','1'])]
+        print(ok.nsmallest(5, 'mmgbsa_dg_bind')[['rank','seq','mmgbsa_dg_bind']].to_string(index=False))
+    "
+
+### 9.4 Check charge used in MMGBSA
+
+    python -c "
+    import pandas as pd
+    df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
+    print(df[['rank','mmgbsa_charge','mmgbsa_charge_source']].head(10).to_string(index=False))
+    "
+
+### 9.5 Export top candidates by MMGBSA
+
+    python scripts/export_mmgbsa_best.py --run_dir runs/ce_run1
+
+### 9.6 MD results
+
+    cat runs/ce_run1/md/md_summary.csv
+
+---
+
+## 10) Common failure modes
+
+### 10.1 All scores are 1e9 (penalty)
+
 Check:
-1. `topN.csv` → `error` column
-2. `logs/ce_design.log` tail
-3. whether `fold/<hash>/*_AA.pdb` exists
-4. whether `dock/<hash>/frame_*/lig_*/` contains `.vina.log`
+1. topN.csv error column
+2. logs/ce_design.log tail
+3. Whether fold/<hash>/*_AA.pdb exists
+4. Whether dock/<hash>/frame_*/lig_*/ contains .vina.log
 
-### 7.2 Multi-frame export not working
+### 10.2 Multi-frame export not working
 
-If `frames_in_trafl = 1`, the trajectory contains only one frame, so exporting multiple PDBs will not work. Ensure SimRNA is configured to output a trajectory with multiple frames, and that the pipeline is exporting the requested frame range (`simrna_frames`).
+If frames_in_trafl = 1, ensure SimRNA outputs multiple frames and simrna_frames
+requests the right range.
 
-### 7.3 Resume does not advance
+### 10.3 MMGBSA all failed (mmgbsa_ok=False)
+
+Common causes:
+
+1. Wrong ligand charge:
+
+       cat runs/ce_run1/ligand_ensemble/charge.txt
+       # Fix:
+       python ligand/rdkit_conformers.py data/ligand.sdf \
+           --out_dir runs/ce_run1/ligand_ensemble \
+           --charge -1
+
+2. Antechamber failed (check antechamber.log):
+
+       tail -50 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/antechamber.log
+
+3. tleap failed (check tleap.log):
+
+       tail -30 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/tleap.log
+
+Diagnosis command:
+
+    python -c "
+    import pandas as pd
+    df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
+    failed = df[df['mmgbsa_ok'].astype(str).str.lower() == 'false']
+    print(f'Failed: {len(failed)}/{len(df)}')
+    if len(failed) > 0:
+        print(failed[['rank','mmgbsa_error']].head(3).to_string(index=False))
+    "
+
+### 10.4 Resume does not advance
 
 Check:
-- `checkpoint.json` for current iteration state
-- whether the run is started with resume enabled (if your config supports it)
-- whether iteration counters in `history.csv` advance after a resume run
+- checkpoint.json for current iteration state
+- history.csv for new rows after resume
 
 ---
 
-## 8) CE theory mapping 
+## 11) Visualization
 
-This pipeline matches the standard CE loop:
+### 11.1 Plot convergence
 
-- A. Initialize distribution → `dist.json`
-- B. Sample batch → `ce.batch`
-- C. Evaluate samples → SimRNA multi-frame + ligand multi-conformer + Vina + aggregation
-- D. Select elites → `elite_frac` + diversity constraints
-- E. Rescore topM → MMGBSA via `rescore/iter_XXX/`
-- F. Update distribution → feedback updates `dist.json`, then resume to next iteration
+    python scripts/visualize_run.py --run_dir runs/ce_run1
 
-When you successfully generate new sequences in iteration 2 after rescoring feedback, the “E → F → next B/C” chain is proven.
-
----
-
-## 9) Reproducibility notes 
-
-To reproduce my results reliably:
-- Keep `seed` fixed and store `config_resolved.json`
-- Always archive:
-  - the exact configuration file used
-  - `dist.json` and `checkpoint.json`
-  - `topN.csv` and `history.csv`
-  - software versions (RDKit, Vina, SimRNA build)
-
-For debugging, the minimum set I use to triage failures is:
-- `topN.csv` (first 5 lines + `error`)
-- `logs/ce_design.log` (last 100 lines)
-- one `fold/<hash>/` listing and `frames_in_trafl` count
+Output plots:
+- plots/history_best_mean.png
+- plots/history_penalty.png
+- plots/mmgbsa_by_iter.png
+- plots/mmgbsa_vs_vina.png
+- plots/md/rank_00x_rmsd.png
+- plots/md/rank_00x_rmsf.png
 
 ---
 
-## 10) How to run (the commands you actually type)
+## 12) CE theory mapping
 
-> TL;DR: **first preflight**, then run either **one-round** (debug) or **full loop** (production).
-
-### 10.1 Preflight (sanity check your environment)
-
-```bash
-bash scripts/preflight.sh
-```
-
-What it checks (high level):
-- Conda env / python imports
-- external binaries in PATH (SimRNA, trafl2pdbs, vina, AmberTools: tleap/antechamber/parmchk2/sander/MMPBSA.py)
-- write permissions + run directory layout
-- (if enabled) summary csv generation hooks
-
-
-### 10.2 Run the full multi-iteration CE+MMGBSA feedback loop (until termination)
-
-```bash
-bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
-```
-
-This loop will:
-1) read `checkpoint.json` to know what iteration is completed
-2) run CE to `iter_completed + 1`
-3) run MMGBSA for that iteration
-4) run feedback to update `dist.json`
-5) repeat until:
-   - `ce.iters` reached **OR**
-   - `stop_reason` in `checkpoint.json` becomes non-empty (early stop / collapse, etc.)
-
-**Important:** if `ce.iters=30`, the loop performs MMGBSA+feedback for every iteration it successfully completes (1..30).  
-If you stop the loop manually and rerun later, it will continue from `checkpoint.json`.
-
-### 10.3 Restart / resume rules 
-
-The pipeline is designed to be restartable:
-- `dist.json` = your CE distribution state
-- `checkpoint.json` = how many iters are finished + stop reason
-
-If those are present, rerunning the scripts will **resume** rather than start from scratch, unless you delete the run directory.
-
-To force a clean run:
-```bash
-rm -rf runs/ce_run1
-```
+- A. Initialize distribution -> dist.json
+- B. Sample batch -> ce.batch
+- C. Evaluate samples -> SimRNA + Vina + aggregation
+- D. Select elites -> elite_frac + diversity constraints
+- E. Rescore topM -> MMGBSA via rescore/iter_XXX/
+- F. Update distribution -> feedback updates dist.json
 
 ---
 
-## 11) What to look at for final results
+## 13) Reproducibility notes
 
-There are two “views”:
+To reproduce results:
+- Keep seed fixed and store config_resolved.json
+- Archive: config file, dist.json, checkpoint.json, topN.csv, history.csv
+- Archive: ligand_ensemble/manifest.json (includes charge info)
+- Record software versions (RDKit, Vina, SimRNA, AmberTools)
 
-### 11.1 Vina (always available): `topN.csv`
-
-```bash
-head -n 10 runs/ce_run1/topN.csv
-```
-
-Use this for:
-- quick ranking
-- sanity check (frames/conformers counted)
-- locate best pose PDBQT and best receptor PDB
-
-### 11.2 MMGBSA ( rescoring): `rescore/iter_XXX/mmgbsa_results.csv`
-
-Per iteration:
-```bash
-ls runs/ce_run1/rescore/iter_001/
-head -n 10 runs/ce_run1/rescore/iter_001/mmgbsa_results.csv
-```
-
-Across the whole run (if you enabled summaries in preflight):
-- `runs/ce_run1/summary_by_vina.csv`
-- `runs/ce_run1/summary_by_mmgbsa.csv`
-
-Recommended final selection strategy:
-1) take the **top K by MMGBSA** (more negative is better, if you’re computing ΔGbind that way)
-2) check their **vina score**, best_frame, and dock pose quality
-3) keep a small diverse set (avoid near-duplicates)
-
-### 11.3 Sort by the best GBSA from small to large and output the top 50
-
-```bash
-python scripts/export_mmgbsa_best.py --run_dir runs/ce_run1
-```
-
-### 11.4 Molecular Dynamics : `/runs/ce_run1/md`
-The final summary results are presented in this document
-- `/runs/ce_run1/md/md_summary.csv`
-Contains information such as ranking, sequence, score, etc
-
----
-
-## 12) Visualization
-
-### 12.1 Plot convergence from `history.csv`
-
-```bash
-tail -n 20 runs/ce_run1/history.csv
-python scripts/visualize_run.py --run_dir runs/ce_run1
-```
-
-Outputs:
-- `runs/ce_run1/plots/history_best_mean.png`
-- `runs/ce_run1/plots/history_penalty.png` 
-- `runs/ce_run1/plots/mmgbsa_by_iter.png` 
-- `runs/ce_run1/plots/mmgbsa_vs_vina.png`
-- `runs/ce_run1/plots/md/rank_00x_rmsd.png`
-- `runs/ce_run1/plots/md/rank_00x_rmsf.png`
-
+Minimum debugging set:
+- topN.csv (first 5 lines + error column)
+- logs/ce_design.log (last 100 lines)
+- ligand_ensemble/charge.txt
+- One fold/<hash>/ listing
