@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import argparse
@@ -85,6 +88,10 @@ def _write_csv(path: Path, rows: List[Dict], fieldnames: List[str]) -> None:
 
 
 def _jobs_from_topN_csv(topn_csv: Path, topM: Optional[int] = None) -> List[Dict]:
+    """
+    Optional mode: create a manifest directly from topN.csv.
+    In the CE pipeline, the preferred mode is manifest.jsonl generated under rescore/iter_xxx/.
+    """
     if not topn_csv.exists():
         raise FileNotFoundError(f"topN.csv not found: {topn_csv}")
 
@@ -246,7 +253,7 @@ def _make_complex_pdb(receptor_pdb: Path, ligand_pdb: Path, out_complex: Path) -
 
 
 # -----------------------
-# ligand name alignment: mol2 -> tpl pdb, then inject dock coords
+# ligand name alignment: mol2 -> template pdb, then inject dock coords
 # -----------------------
 def _pdb_atom_lines(path: Path, only_resname: Optional[str] = None) -> List[str]:
     lines = []
@@ -264,8 +271,30 @@ def _pdb_atom_lines(path: Path, only_resname: Optional[str] = None) -> List[str]
     return lines
 
 
+def _pdb_element(ln: str) -> str:
+    if len(ln) >= 78:
+        el = ln[76:78].strip()
+        if el:
+            return el.upper()
+    name = ln[12:16].strip()
+    name = re.sub(r"\d+", "", name)
+    if not name:
+        return ""
+    # Common cases: "Cl", "Br"
+    if len(name) >= 2 and name[0].isalpha() and name[1].islower():
+        return (name[0] + name[1]).upper()
+    return name[0].upper()
+
+
+def _is_hydrogen_line(ln: str) -> bool:
+    el = _pdb_element(ln)
+    if el == "H":
+        return True
+    an = ln[12:16].strip().upper()
+    return an.startswith("H")
+
+
 def _extract_xyz_from_pdb_atom_line(ln: str) -> Tuple[float, float, float]:
-    # PDB columns: x 31-38, y 39-46, z 47-54 (1-based)
     x = float(ln[30:38])
     y = float(ln[38:46])
     z = float(ln[46:54])
@@ -275,7 +304,6 @@ def _extract_xyz_from_pdb_atom_line(ln: str) -> Tuple[float, float, float]:
 def _format_xyz_into_pdb_atom_line(ln: str, x: float, y: float, z: float) -> str:
     if len(ln) < 80:
         ln = ln + (" " * (80 - len(ln)))
-    # keep everything else; replace xyz fields with fixed width %8.3f
     return ln[:30] + f"{x:8.3f}{y:8.3f}{z:8.3f}" + ln[54:]
 
 
@@ -294,24 +322,41 @@ def _inject_pose_coords_to_tpl(
     pose_pdb: Path,
     out_pdb: Path,
 ) -> None:
-    # template lines (names must be preserved)
+    """
+    Inject dock pose coordinates into the ligand template PDB (names/types from template are preserved).
+
+    If atom counts mismatch (commonly due to missing H in pose), we inject only heavy-atom coordinates
+    and keep hydrogen coordinates from the template.
+    """
     tpl_lines = _pdb_atom_lines(tpl_pdb)
     pose_lines = _pdb_atom_lines(pose_pdb)
 
-    if len(tpl_lines) != len(pose_lines):
+    if len(tpl_lines) == len(pose_lines):
+        out_lines: List[str] = []
+        for tln, pln in zip(tpl_lines, pose_lines):
+            x, y, z = _extract_xyz_from_pdb_atom_line(pln)
+            out_lines.append(_format_xyz_into_pdb_atom_line(tln, x, y, z).rstrip())
+        out_pdb.write_text("\n".join(out_lines) + "\n", errors="ignore")
+        return
+
+    # Heavy-atom-only injection fallback
+    tpl_heavy_idx = [i for i, ln in enumerate(tpl_lines) if not _is_hydrogen_line(ln)]
+    pose_heavy_idx = [i for i, ln in enumerate(pose_lines) if not _is_hydrogen_line(ln)]
+
+    if len(tpl_heavy_idx) != len(pose_heavy_idx):
         raise RuntimeError(
-            f"Atom count mismatch when aligning ligand names:\n"
-            f"  tpl atoms={len(tpl_lines)} ({tpl_pdb})\n"
-            f"  pose atoms={len(pose_lines)} ({pose_pdb})\n"
-            f"Fix by ensuring the pose PDB contains the same atoms as ligand.mol2 (incl H)."
+            f"Atom count mismatch when aligning ligand coordinates:\n"
+            f"  tpl atoms={len(tpl_lines)} heavy={len(tpl_heavy_idx)} ({tpl_pdb})\n"
+            f"  pose atoms={len(pose_lines)} heavy={len(pose_heavy_idx)} ({pose_pdb})\n"
+            f"Cannot align coordinates reliably."
         )
 
-    out_lines: List[str] = []
-    for tln, pln in zip(tpl_lines, pose_lines):
-        x, y, z = _extract_xyz_from_pdb_atom_line(pln)
-        out_lines.append(_format_xyz_into_pdb_atom_line(tln, x, y, z).rstrip())
+    out_lines = tpl_lines[:]
+    for ti, pi in zip(tpl_heavy_idx, pose_heavy_idx):
+        x, y, z = _extract_xyz_from_pdb_atom_line(pose_lines[pi])
+        out_lines[ti] = _format_xyz_into_pdb_atom_line(tpl_lines[ti], x, y, z)
 
-    out_pdb.write_text("\n".join(out_lines) + "\n", errors="ignore")
+    out_pdb.write_text("\n".join([ln.rstrip() for ln in out_lines]) + "\n", errors="ignore")
 
 
 # -----------------------
@@ -449,6 +494,16 @@ def _pick_job_paths(job: Dict) -> Tuple[Path, Path]:
     return Path(rec).expanduser().resolve(), Path(pose).expanduser().resolve()
 
 
+def _pick_ligand_source(job: Dict) -> Optional[Path]:
+    lig = (job.get("best_ligand_sdf") or job.get("ligand_sdf") or "").strip()
+    if not lig:
+        return None
+    p = Path(lig).expanduser()
+    if not p.is_absolute():
+        p = p.resolve()
+    return p if p.exists() else None
+
+
 def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_override: Optional[int]) -> Dict:
     _require_exe("obabel")
     _require_exe("pdb4amber")
@@ -504,6 +559,7 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
     )
     _sanitize_ligand_pdb(lig_pose_raw, lig_pose_sane, resname="LIG", chain="Z")
 
+    # Try to add H to the pose (may fail; heavy-atom-only injection is supported later)
     _run_logged(
         ["obabel", "-ipdb", str(lig_pose_sane), "-opdb", "-O", str(lig_pose_h), "-p", f"{cfg.ph:.2f}"],
         cwd=work,
@@ -514,7 +570,7 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
         shutil.copyfile(lig_pose_sane, lig_pose_h)
 
     # -----------------------
-    # 3) ligand parameterization (from lig_pose_h so atom names match!)
+    # 3) ligand parameterization (IMPORTANT: use original ligand file if available)
     # -----------------------
     if net_charge_override is not None:
         net_charge = int(net_charge_override)
@@ -523,10 +579,47 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
         if net_charge is None:
             net_charge = 0
 
+    lig_src = _pick_ligand_source(job)
+    lig_input = work / "ligand_input.sdf"
+
+    if lig_src is not None:
+        # Convert to SDF with explicit hydrogens when possible
+        # This preserves bond order better than PDB derived from docking.
+        _run_logged(
+            ["obabel", str(lig_src), "-O", str(lig_input), "-h"],
+            cwd=work,
+            log_path=work / "obabel_ligand_to_sdf.log",
+            allow_fail=True,
+        )
+        if (not lig_input.exists()) or lig_input.stat().st_size == 0:
+            # Fallback: just copy the source
+            shutil.copyfile(lig_src, lig_input)
+    else:
+        # Fallback: use pose PDB (less reliable)
+        shutil.copyfile(lig_pose_h, lig_input)
+
     lig_mol2 = work / "ligand.mol2"
     lig_frcmod = work / "ligand.frcmod"
 
-    def _do_antechamber(method: str) -> None:
+    def _do_antechamber_from_sdf(method: str) -> None:
+        _run_logged(
+            [
+                "antechamber",
+                "-i", str(lig_input),
+                "-fi", "sdf",
+                "-o", str(lig_mol2),
+                "-fo", "mol2",
+                "-at", cfg.at_forcefield,
+                "-c", method,
+                "-nc", str(int(net_charge)),
+                "-s", "2",
+            ],
+            cwd=work,
+            log_path=work / "antechamber.log",
+        )
+
+    def _do_antechamber_from_pose_pdb(method: str) -> None:
+        # Last-resort fallback; may fail for ligands requiring correct bond orders.
         _run_logged(
             [
                 "antechamber",
@@ -544,14 +637,20 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
         )
 
     try:
-        _do_antechamber(cfg.charge_method)
+        if lig_src is not None:
+            _do_antechamber_from_sdf(cfg.charge_method)
+        else:
+            _do_antechamber_from_pose_pdb(cfg.charge_method)
     except Exception as e1:
         if (cfg.charge_method == "bcc") and (not cfg.no_gas_fallback):
             (work / "antechamber_fallback_reason.txt").write_text(
                 f"Primary antechamber failed with bcc. Error: {repr(e1)}\nTrying gas fallback.\n",
                 errors="ignore",
             )
-            _do_antechamber("gas")
+            if lig_src is not None:
+                _do_antechamber_from_sdf("gas")
+            else:
+                _do_antechamber_from_pose_pdb("gas")
         else:
             raise
 
@@ -562,9 +661,7 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
     )
 
     # -----------------------
-    # 4) CRITICAL ROOT FIX:
-    #    build a ligand template PDB FROM ligand.mol2 (names match),
-    #    then inject dock pose coords -> ligand_pose_named.pdb
+    # 4) Build ligand pose with correct names (template from ligand.mol2 + inject dock coords)
     # -----------------------
     lig_tpl = _write_ligand_tpl_pdb_from_mol2(work)
     lig_pose_named = work / "ligand_pose_named.pdb"
@@ -583,8 +680,8 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
     _run_logged(["tleap", "-f", str(leap_in)], cwd=work, log_path=work / "tleap.log")
 
     for fn in ["receptor.prmtop", "ligand.prmtop", "complex.prmtop"]:
-        p = work / fn
-        if (not p.exists()) or p.stat().st_size < 1000:
+        ptop = work / fn
+        if (not ptop.exists()) or ptop.stat().st_size < 1000:
             raise RuntimeError(f"tleap did not generate a valid {fn}. See {work/'tleap.log'}")
 
     # -----------------------
@@ -621,7 +718,7 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
             "mmgbsa_dg_bind": dg if dg is not None else 1e9,
             "mmgbsa_workdir": str(work),
             "mmgbsa_final": str(final_dat) if final_dat.exists() else "",
-            "mmgbsa_log": str(work / "mmpbsa.log"),
+            "mmgbsa_log": str(work / "mmpbsa.log") if (work / "mmpbsa.log").exists() else "",
             "mmgbsa_charge": int(net_charge),
             "mmgbsa_charge_method": cfg.charge_method,
             "mmgbsa_igb": int(cfg.igb),
