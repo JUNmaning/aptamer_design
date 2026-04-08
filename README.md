@@ -190,11 +190,11 @@ Before running the main pipeline, prepare ligand conformers with the correct cha
     python ligand/rdkit_conformers.py data/PFHxS.sdf \
         --out_dir runs/ce_run1/ligand_ensemble \
         --n_confs 10 \
-        --charge -1
-
+        --charge n     #Set it yourself, otherwise the small molecule file will be automatically read to determine the charge
+   
     # Verify:
     cat runs/ce_run1/ligand_ensemble/charge.txt
-    # Should output: -1
+    # Should output: n
 
 This charge will be automatically used by all downstream steps including
 CE docking evaluation, MMGBSA rescoring, and all analysis.
