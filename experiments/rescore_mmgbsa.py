@@ -3,8 +3,11 @@
 """
 MM/GBSA rescoring for aptamer-ligand complexes.
 
-This module reads ligand charge from the normalized manifest (created by
-ligand/rdkit_conformers.py) to ensure consistent parameterization.
+Key improvements over original:
+  - Auto-detect ligand charge from ligand_ensemble/manifest.json
+  - Always prefer original SDF for antechamber (not PDBQT-derived PDB)
+  - Robust fallback chain for charge detection
+  - Better error diagnostics
 """
 
 from __future__ import annotations
@@ -19,18 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
-
-# Import charge utilities from ligand module
-try:
-    from ligand.rdkit_conformers import (
-        get_ligand_charge_auto,
-        get_ligand_charge_from_manifest,
-        compute_ligand_charge_info,
-    )
-    HAS_LIGAND_MODULE = True
-except ImportError:
-    HAS_LIGAND_MODULE = False
 
 
 # -----------------------
@@ -106,9 +97,6 @@ def _write_csv(path: Path, rows: List[Dict], fieldnames: List[str]) -> None:
 
 
 def _jobs_from_topN_csv(topn_csv: Path, topM: Optional[int] = None) -> List[Dict]:
-    """
-    Create job manifest from topN.csv.
-    """
     if not topn_csv.exists():
         raise FileNotFoundError(f"topN.csv not found: {topn_csv}")
 
@@ -168,7 +156,6 @@ def _normalize_rna_resname(res: str) -> str:
         return r
     if r in _RNA_MAP:
         return _RNA_MAP[r]
-
     letters = re.sub(r"[^A-Za-z]", "", r).upper()
     if letters in _RNA_MAP:
         return _RNA_MAP[letters]
@@ -186,26 +173,21 @@ def _fix_rna_pdb_resnames(in_pdb: Path, out_pdb: Path) -> None:
         if not (ln.startswith("ATOM") or ln.startswith("HETATM")):
             out_lines.append(ln)
             continue
-
         if len(ln) < 80:
             ln = ln.rstrip("\n")
             ln = ln + (" " * (80 - len(ln)))
-
         resname = ln[17:20]
         new_res = _normalize_rna_resname(resname)
         ln = ln[:17] + f"{new_res:>3s}" + ln[20:]
-
         if ln[21].strip() == "":
             ln = ln[:21] + "A" + ln[22:]
-
         out_lines.append(ln.rstrip())
-
     out_pdb.write_text("\n".join(out_lines) + "\n", errors="ignore")
 
 
 def _strip_5prime_phosphate(in_pdb: Path, out_pdb: Path) -> int:
     removed = 0
-    first_key = None  # (chain, resseq, icode)
+    first_key = None
 
     def _res_key(line: str):
         chain = line[21:22]
@@ -219,7 +201,6 @@ def _strip_5prime_phosphate(in_pdb: Path, out_pdb: Path) -> int:
                 key = _res_key(ln)
                 if first_key is None:
                     first_key = key
-
                 if key == first_key:
                     atom = ln[12:16].strip()
                     if atom in {"P", "OP1", "OP2", "O1P", "O2P"}:
@@ -247,7 +228,6 @@ def _sanitize_ligand_pdb(in_pdb: Path, out_pdb: Path, resname: str = "LIG", chai
 def _make_complex_pdb(receptor_pdb: Path, ligand_pdb: Path, out_complex: Path) -> None:
     rec_txt = receptor_pdb.read_text(errors="ignore").splitlines()
     lig_txt = ligand_pdb.read_text(errors="ignore").splitlines()
-
     rec_lines: List[str] = []
     for ln in rec_txt:
         if ln.startswith(("END", "MODEL", "ENDMDL")):
@@ -256,7 +236,6 @@ def _make_complex_pdb(receptor_pdb: Path, ligand_pdb: Path, out_complex: Path) -
             rec_lines.append(ln.rstrip())
     if rec_lines and not rec_lines[-1].startswith("TER"):
         rec_lines.append("TER")
-
     lig_lines: List[str] = []
     for ln in lig_txt:
         if ln.startswith(("END", "MODEL", "ENDMDL", "TER")):
@@ -265,12 +244,11 @@ def _make_complex_pdb(receptor_pdb: Path, ligand_pdb: Path, out_complex: Path) -
             lig_lines.append(ln.rstrip())
     lig_lines.append("TER")
     lig_lines.append("END")
-
     out_complex.write_text("\n".join(rec_lines + lig_lines) + "\n", errors="ignore")
 
 
 # -----------------------
-# ligand name alignment: mol2 -> template pdb, then inject dock coords
+# ligand coordinate injection
 # -----------------------
 def _pdb_atom_lines(path: Path, only_resname: Optional[str] = None) -> List[str]:
     lines = []
@@ -310,14 +288,11 @@ def _is_hydrogen_line(ln: str) -> bool:
     return an.startswith("H")
 
 
-def _extract_xyz_from_pdb_atom_line(ln: str) -> Tuple[float, float, float]:
-    x = float(ln[30:38])
-    y = float(ln[38:46])
-    z = float(ln[46:54])
-    return x, y, z
+def _extract_xyz(ln: str) -> Tuple[float, float, float]:
+    return float(ln[30:38]), float(ln[38:46]), float(ln[46:54])
 
 
-def _format_xyz_into_pdb_atom_line(ln: str, x: float, y: float, z: float) -> str:
+def _set_xyz(ln: str, x: float, y: float, z: float) -> str:
     if len(ln) < 80:
         ln = ln + (" " * (80 - len(ln)))
     return ln[:30] + f"{x:8.3f}{y:8.3f}{z:8.3f}" + ln[54:]
@@ -326,54 +301,43 @@ def _format_xyz_into_pdb_atom_line(ln: str, x: float, y: float, z: float) -> str
 def _write_ligand_tpl_pdb_from_mol2(work: Path) -> Path:
     tpl = work / "ligand_tpl.pdb"
     _run_logged(
-        ["antechamber", "-i", "ligand.mol2", "-fi", "mol2", "-o", str(tpl), "-fo", "pdb", "-s", "2"],
-        cwd=work,
-        log_path=work / "antechamber_mol2_to_pdb.log",
+        ["antechamber", "-i", "ligand.mol2", "-fi", "mol2",
+         "-o", str(tpl), "-fo", "pdb", "-s", "2"],
+        cwd=work, log_path=work / "antechamber_mol2_to_pdb.log",
     )
     return tpl
 
 
-def _inject_pose_coords_to_tpl(
-    tpl_pdb: Path,
-    pose_pdb: Path,
-    out_pdb: Path,
-) -> None:
-    """
-    Inject dock pose coordinates into the ligand template PDB.
-    """
+def _inject_pose_coords_to_tpl(tpl_pdb: Path, pose_pdb: Path, out_pdb: Path) -> None:
     tpl_lines = _pdb_atom_lines(tpl_pdb)
     pose_lines = _pdb_atom_lines(pose_pdb)
 
     if len(tpl_lines) == len(pose_lines):
-        out_lines: List[str] = []
+        out = []
         for tln, pln in zip(tpl_lines, pose_lines):
-            x, y, z = _extract_xyz_from_pdb_atom_line(pln)
-            out_lines.append(_format_xyz_into_pdb_atom_line(tln, x, y, z).rstrip())
-        out_pdb.write_text("\n".join(out_lines) + "\n", errors="ignore")
+            x, y, z = _extract_xyz(pln)
+            out.append(_set_xyz(tln, x, y, z).rstrip())
+        out_pdb.write_text("\n".join(out) + "\n", errors="ignore")
         return
 
-    # Heavy-atom-only injection fallback
-    tpl_heavy_idx = [i for i, ln in enumerate(tpl_lines) if not _is_hydrogen_line(ln)]
-    pose_heavy_idx = [i for i, ln in enumerate(pose_lines) if not _is_hydrogen_line(ln)]
+    tpl_heavy = [i for i, ln in enumerate(tpl_lines) if not _is_hydrogen_line(ln)]
+    pose_heavy = [i for i, ln in enumerate(pose_lines) if not _is_hydrogen_line(ln)]
 
-    if len(tpl_heavy_idx) != len(pose_heavy_idx):
+    if len(tpl_heavy) != len(pose_heavy):
         raise RuntimeError(
-            f"Atom count mismatch when aligning ligand coordinates:\n"
-            f"  tpl atoms={len(tpl_lines)} heavy={len(tpl_heavy_idx)} ({tpl_pdb})\n"
-            f"  pose atoms={len(pose_lines)} heavy={len(pose_heavy_idx)} ({pose_pdb})\n"
-            f"Cannot align coordinates reliably."
+            f"Atom count mismatch: tpl={len(tpl_lines)}(heavy={len(tpl_heavy)}) "
+            f"pose={len(pose_lines)}(heavy={len(pose_heavy)})"
         )
 
-    out_lines = tpl_lines[:]
-    for ti, pi in zip(tpl_heavy_idx, pose_heavy_idx):
-        x, y, z = _extract_xyz_from_pdb_atom_line(pose_lines[pi])
-        out_lines[ti] = _format_xyz_into_pdb_atom_line(tpl_lines[ti], x, y, z)
-
-    out_pdb.write_text("\n".join([ln.rstrip() for ln in out_lines]) + "\n", errors="ignore")
+    out = tpl_lines[:]
+    for ti, pi in zip(tpl_heavy, pose_heavy):
+        x, y, z = _extract_xyz(pose_lines[pi])
+        out[ti] = _set_xyz(tpl_lines[ti], x, y, z)
+    out_pdb.write_text("\n".join([ln.rstrip() for ln in out]) + "\n", errors="ignore")
 
 
 # -----------------------
-# charge detection (multiple methods with priority)
+# charge detection
 # -----------------------
 def _detect_net_charge_from_pdbqt(pdbqt: Path) -> Optional[int]:
     """Detect charge from PDBQT Gasteiger charges (last resort)."""
@@ -434,86 +398,163 @@ def determine_ligand_charge(
     work: Path,
 ) -> Tuple[int, str]:
     """
-    Determine ligand charge using multiple sources with priority:
-    
-    1. Command-line override (--net_charge)
-    2. Ligand ensemble manifest (most reliable)
-    3. SDF NET_CHARGE property (from our prep)
-    4. RDKit formal charge from ligand SDF
-    5. PDBQT Gasteiger sum (least reliable)
-    6. Fallback to 0
-    
-    Returns:
-        (charge, source): The charge and detection source for logging.
+    Determine ligand charge with priority:
+      1. --net_charge CLI override
+      2. ligand_ensemble/manifest.json (charge_info.formal_charge)
+      3. ligand_ensemble/charge.json
+      4. ligand_ensemble/charge.txt
+      5. SDF NET_CHARGE property from job ligand_sdf
+      6. RDKit formal charge from job ligand_sdf
+      7. RDKit formal charge from original data/ligand.sdf
+      8. PDBQT Gasteiger sum
+      9. Fallback 0
     """
-    # Priority 1: Command-line override
+    # 1) CLI override
     if net_charge_override is not None:
         return int(net_charge_override), "cli_override"
-    
-    # Priority 2: Ligand ensemble manifest
-    ligand_manifest = run_dir / "ligand_ensemble" / "manifest.json"
-    if ligand_manifest.exists():
+
+    # 2) manifest.json
+    manifest_path = run_dir / "ligand_ensemble" / "manifest.json"
+    if manifest_path.exists():
         try:
-            manifest = json.loads(ligand_manifest.read_text())
-            charge_info = manifest.get("charge_info", {})
-            if "formal_charge" in charge_info:
-                charge = int(charge_info["formal_charge"])
-                # Log validation status
-                if not charge_info.get("validation_passed", True):
+            manifest = json.loads(manifest_path.read_text())
+            ci = manifest.get("charge_info", {})
+            if "formal_charge" in ci:
+                charge = int(ci["formal_charge"])
+                if not ci.get("validation_passed", True):
                     (work / "charge_warning.txt").write_text(
-                        f"Charge validation warning: {charge_info.get('validation_notes', 'unknown')}\n"
+                        f"Charge validation warning: {ci.get('validation_notes', '')}\n"
                     )
                 return charge, "manifest"
         except Exception:
             pass
-    
-    # Priority 3: charge.json in ligand_ensemble
-    charge_json = run_dir / "ligand_ensemble" / "charge.json"
-    if charge_json.exists():
+
+    # 3) charge.json
+    cj = run_dir / "ligand_ensemble" / "charge.json"
+    if cj.exists():
         try:
-            info = json.loads(charge_json.read_text())
+            info = json.loads(cj.read_text())
             if "formal_charge" in info:
                 return int(info["formal_charge"]), "charge_json"
         except Exception:
             pass
-    
-    # Priority 4: SDF NET_CHARGE property from ligand_sdf in job
+
+    # 4) charge.txt
+    ct = run_dir / "ligand_ensemble" / "charge.txt"
+    if ct.exists():
+        try:
+            return int(ct.read_text().strip()), "charge_txt"
+        except Exception:
+            pass
+
+    # 5-6) From job ligand_sdf
     ligand_sdf = job.get("best_ligand_sdf") or job.get("ligand_sdf") or ""
     if ligand_sdf:
         sdf_path = Path(ligand_sdf)
         if sdf_path.exists():
-            charge = _detect_net_charge_from_sdf_property(sdf_path)
-            if charge is not None:
-                return charge, "sdf_property"
-    
-    # Priority 5: RDKit formal charge from ligand SDF
-    if ligand_sdf:
-        sdf_path = Path(ligand_sdf)
-        if sdf_path.exists():
-            charge = _detect_net_charge_from_sdf_rdkit(sdf_path)
-            if charge is not None:
-                return charge, "rdkit_formal"
-    
-    # Priority 6: PDBQT Gasteiger sum
+            c = _detect_net_charge_from_sdf_property(sdf_path)
+            if c is not None:
+                return c, "sdf_property"
+            c = _detect_net_charge_from_sdf_rdkit(sdf_path)
+            if c is not None:
+                return c, "rdkit_formal"
+
+    # 7) From original ligand file in data/
+    for orig in [
+        run_dir / "data" / "ligand.sdf",
+        Path("data/ligand.sdf").resolve(),
+        Path("data/ligand.pdb").resolve(),
+    ]:
+        if orig.exists():
+            c = _detect_net_charge_from_sdf_rdkit(orig)
+            if c is not None:
+                return c, f"rdkit_original({orig.name})"
+
+    # 8) PDBQT
     pose_pdbqt = job.get("best_dock_pose_pdbqt") or job.get("pose_pdbqt") or ""
     if pose_pdbqt:
-        pdbqt_path = Path(pose_pdbqt)
-        if pdbqt_path.exists():
-            charge = _detect_net_charge_from_pdbqt(pdbqt_path)
-            if charge is not None:
-                return charge, "pdbqt_gasteiger"
-    
-    # Fallback
+        pp = Path(pose_pdbqt)
+        if pp.exists():
+            c = _detect_net_charge_from_pdbqt(pp)
+            if c is not None:
+                return c, "pdbqt_gasteiger"
+
+    # 9) Fallback
     (work / "charge_warning.txt").write_text(
         "WARNING: Could not auto-detect ligand charge from any source.\n"
         "Defaulting to 0. If ligand is charged, set --net_charge explicitly.\n"
-        f"Searched: manifest, charge.json, sdf_property, rdkit, pdbqt\n"
     )
     return 0, "fallback"
 
 
+def _find_original_ligand_sdf(job: Dict, run_dir: Path) -> Optional[Path]:
+    """
+    Find the ORIGINAL ligand SDF file (with correct bond orders).
+    
+    This is CRITICAL: antechamber must use the original SDF, not
+    a PDBQT-derived PDB which loses bond order information.
+    
+    Search order:
+      1. job['best_ligand_sdf'] / job['ligand_sdf']
+      2. ligand_ensemble/conf_001.sdf (first conformer)
+      3. data/ligand.sdf (original input)
+      4. inputs.ligand from config
+    """
+    # 1) From job record
+    for key in ["best_ligand_sdf", "ligand_sdf"]:
+        val = (job.get(key) or "").strip()
+        if val:
+            p = Path(val)
+            if p.exists() and p.stat().st_size > 0:
+                return p
+
+    # 2) From ligand ensemble (generated conformers have correct bond orders)
+    ensemble_dir = run_dir / "ligand_ensemble"
+    if ensemble_dir.exists():
+        # Try manifest first
+        manifest_path = ensemble_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                items = manifest.get("items", [])
+                if items:
+                    p = Path(items[0].get("path", ""))
+                    if p.exists() and p.stat().st_size > 0:
+                        return p
+            except Exception:
+                pass
+        # Try first conf file
+        conf1 = ensemble_dir / "conf_001.sdf"
+        if conf1.exists():
+            return conf1
+
+    # 3) Original input
+    for candidate in [
+        run_dir / "data" / "ligand.sdf",
+        Path("data/ligand.sdf").resolve(),
+    ]:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+
+    # 4) Check config
+    resolved_cfg = run_dir / "resolved_config.yaml"
+    if resolved_cfg.exists():
+        try:
+            import yaml
+            cfg = yaml.safe_load(resolved_cfg.read_text())
+            lig = cfg.get("inputs", {}).get("ligand", "")
+            if lig:
+                p = Path(lig).expanduser().resolve()
+                if p.exists():
+                    return p
+        except Exception:
+            pass
+
+    return None
+
+
 # -----------------------
-# parsing MMPBSA output
+# MMPBSA output parsing
 # -----------------------
 def _parse_mmpbsa_final_results(final_dat: Path) -> Optional[float]:
     if not final_dat.exists():
@@ -530,14 +571,14 @@ def _parse_mmpbsa_final_results(final_dat: Path) -> Optional[float]:
 
 
 # -----------------------
-# MM/GBSA job
+# MM/GBSA config & core
 # -----------------------
 @dataclass
 class MMGBSAConfig:
     leaprc_nucleic: str = "leaprc.RNA.OL3"
     leaprc_smallmol: str = "leaprc.gaff2"
     at_forcefield: str = "gaff2"
-    charge_method: str = "bcc"         # bcc or gas
+    charge_method: str = "bcc"
     no_gas_fallback: bool = False
     igb: int = 5
     saltcon: float = 0.150
@@ -548,28 +589,26 @@ class MMGBSAConfig:
 def _write_tleap_in(work: Path, cfg: MMGBSAConfig) -> Path:
     leap_in = work / "tleap.in"
     leap_in.write_text(
-        "\n".join(
-            [
-                f"source {cfg.leaprc_nucleic}",
-                f"source {cfg.leaprc_smallmol}",
-                "",
-                "LIG = loadMol2 ligand.mol2",
-                "loadamberparams ligand.frcmod",
-                "",
-                "REC = loadpdb receptor_amber.pdb",
-                "COM = loadpdb complex.pdb",
-                "",
-                "check REC",
-                "check LIG",
-                "check COM",
-                "",
-                "saveamberparm REC receptor.prmtop receptor.inpcrd",
-                "saveamberparm LIG ligand.prmtop ligand.inpcrd",
-                "saveamberparm COM complex.prmtop complex.inpcrd",
-                "quit",
-                "",
-            ]
-        ),
+        "\n".join([
+            f"source {cfg.leaprc_nucleic}",
+            f"source {cfg.leaprc_smallmol}",
+            "",
+            "LIG = loadMol2 ligand.mol2",
+            "loadamberparams ligand.frcmod",
+            "",
+            "REC = loadpdb receptor_amber.pdb",
+            "COM = loadpdb complex.pdb",
+            "",
+            "check REC",
+            "check LIG",
+            "check COM",
+            "",
+            "saveamberparm REC receptor.prmtop receptor.inpcrd",
+            "saveamberparm LIG ligand.prmtop ligand.inpcrd",
+            "saveamberparm COM complex.prmtop complex.inpcrd",
+            "quit",
+            "",
+        ]),
         errors="ignore",
     )
     return leap_in
@@ -578,16 +617,14 @@ def _write_tleap_in(work: Path, cfg: MMGBSAConfig) -> Path:
 def _write_cpptraj_in(work: Path) -> Path:
     inp = work / "cpptraj.in"
     inp.write_text(
-        "\n".join(
-            [
-                "parm complex.prmtop",
-                "trajin complex.inpcrd 1 1",
-                "trajout complex.mdcrd",
-                "go",
-                "quit",
-                "",
-            ]
-        ),
+        "\n".join([
+            "parm complex.prmtop",
+            "trajin complex.inpcrd 1 1",
+            "trajout complex.mdcrd",
+            "go",
+            "quit",
+            "",
+        ]),
         errors="ignore",
     )
     return inp
@@ -596,18 +633,16 @@ def _write_cpptraj_in(work: Path) -> Path:
 def _write_mmpbsa_in(work: Path, cfg: MMGBSAConfig) -> Path:
     inp = work / "mmpbsa.in"
     inp.write_text(
-        "\n".join(
-            [
-                "&general",
-                "  startframe=1, endframe=1, interval=1,",
-                "  verbose=1,",
-                "/",
-                "&gb",
-                f"  igb={int(cfg.igb)}, saltcon={float(cfg.saltcon):.3f},",
-                "/",
-                "",
-            ]
-        ),
+        "\n".join([
+            "&general",
+            "  startframe=1, endframe=1, interval=1,",
+            "  verbose=1,",
+            "/",
+            "&gb",
+            f"  igb={int(cfg.igb)}, saltcon={float(cfg.saltcon):.3f},",
+            "/",
+            "",
+        ]),
         errors="ignore",
     )
     return inp
@@ -617,18 +652,8 @@ def _pick_job_paths(job: Dict) -> Tuple[Path, Path]:
     rec = job.get("best_receptor_pdb") or job.get("receptor_pdb") or ""
     pose = job.get("best_dock_pose_pdbqt") or job.get("pose_pdbqt") or ""
     if not rec or not pose:
-        raise KeyError("Job missing receptor/pose path. Need receptor_pdb and pose_pdbqt.")
+        raise KeyError("Job missing receptor/pose path.")
     return Path(rec).expanduser().resolve(), Path(pose).expanduser().resolve()
-
-
-def _pick_ligand_source(job: Dict) -> Optional[Path]:
-    lig = (job.get("best_ligand_sdf") or job.get("ligand_sdf") or "").strip()
-    if not lig:
-        return None
-    p = Path(lig).expanduser()
-    if not p.is_absolute():
-        p = p.resolve()
-    return p if p.exists() else None
 
 
 def run_one_mmgbsa(
@@ -667,51 +692,46 @@ def run_one_mmgbsa(
 
     _run_logged(
         ["pdb4amber", "-i", str(receptor_fix), "-o", str(receptor_amber_tmp), "--nohyd"],
-        cwd=work,
-        log_path=work / "pdb4amber.log",
+        cwd=work, log_path=work / "pdb4amber.log",
     )
 
     n_removed = _strip_5prime_phosphate(receptor_amber_tmp, receptor_amber_stripped)
     if n_removed > 0:
         shutil.copyfile(receptor_amber_stripped, receptor_amber_final)
-        print(f"[mmgbsa] stripped 5' phosphate atoms: removed={n_removed} -> {receptor_amber_final.name}")
+        print(f"[mmgbsa] stripped 5' phosphate: removed={n_removed} -> {receptor_amber_final.name}")
     else:
         shutil.copyfile(receptor_amber_tmp, receptor_amber_final)
 
     # -----------------------
-    # 2) ligand pose prep (pdbqt -> pdb, first pose)
+    # 2) ligand pose prep (pdbqt -> pdb for coordinates only)
     # -----------------------
     lig_pose_raw = work / "ligand_pose_raw.pdb"
     lig_pose_sane = work / "ligand_pose.pdb"
     lig_pose_h = work / "ligand_pose_H.pdb"
 
     _run_logged(
-        ["obabel", "-ipdbqt", str(pose_pdbqt), "-opdb", "-O", str(lig_pose_raw), "-f", "1", "-l", "1"],
-        cwd=work,
-        log_path=work / "obabel_pose_to_pdb.log",
+        ["obabel", "-ipdbqt", str(pose_pdbqt), "-opdb", "-O",
+         str(lig_pose_raw), "-f", "1", "-l", "1"],
+        cwd=work, log_path=work / "obabel_pose_to_pdb.log",
     )
     _sanitize_ligand_pdb(lig_pose_raw, lig_pose_sane, resname="LIG", chain="Z")
 
     _run_logged(
-        ["obabel", "-ipdb", str(lig_pose_sane), "-opdb", "-O", str(lig_pose_h), "-p", f"{cfg.ph:.2f}"],
-        cwd=work,
-        log_path=work / "obabel_addh.log",
-        allow_fail=True,
+        ["obabel", "-ipdb", str(lig_pose_sane), "-opdb", "-O",
+         str(lig_pose_h), "-p", f"{cfg.ph:.2f}"],
+        cwd=work, log_path=work / "obabel_addh.log", allow_fail=True,
     )
     if (not lig_pose_h.exists()) or lig_pose_h.stat().st_size == 0:
         shutil.copyfile(lig_pose_sane, lig_pose_h)
 
     # -----------------------
-    # 3) Determine ligand charge (IMPROVED: use normalized charge)
+    # 3) Determine ligand charge
     # -----------------------
     net_charge, charge_source = determine_ligand_charge(
-        job=job,
-        run_dir=run_dir,
-        net_charge_override=net_charge_override,
-        work=work,
+        job=job, run_dir=run_dir,
+        net_charge_override=net_charge_override, work=work,
     )
-    
-    # Log charge determination
+
     charge_log = work / "charge_detection.log"
     charge_log.write_text(
         f"Net charge: {net_charge}\n"
@@ -721,49 +741,56 @@ def run_one_mmgbsa(
     print(f"[mmgbsa] rank={rank} charge={net_charge} (source={charge_source})")
 
     # -----------------------
-    # 4) ligand parameterization
+    # 4) ligand parameterization - MUST use original SDF, NOT pdbqt-derived PDB
     # -----------------------
-    lig_src = _pick_ligand_source(job)
-    lig_input = work / "ligand_input.sdf"
-
-    if lig_src is not None:
-        _run_logged(
-            ["obabel", str(lig_src), "-O", str(lig_input), "-h"],
-            cwd=work,
-            log_path=work / "obabel_ligand_to_sdf.log",
-            allow_fail=True,
-        )
-        if (not lig_input.exists()) or lig_input.stat().st_size == 0:
-            shutil.copyfile(lig_src, lig_input)
-    else:
-        shutil.copyfile(lig_pose_h, lig_input)
-
     lig_mol2 = work / "ligand.mol2"
     lig_frcmod = work / "ligand.frcmod"
 
-    def _do_antechamber_from_sdf(method: str) -> None:
-        _run_logged(
-            [
-                "antechamber",
-                "-i", str(lig_input),
-                "-fi", "sdf",
-                "-o", str(lig_mol2),
-                "-fo", "mol2",
-                "-at", cfg.at_forcefield,
-                "-c", method,
-                "-nc", str(int(net_charge)),
-                "-s", "2",
-            ],
-            cwd=work,
-            log_path=work / "antechamber.log",
+    # Find the best source for antechamber (SDF with correct bond orders)
+    original_sdf = _find_original_ligand_sdf(job, run_dir)
+
+    antechamber_input: Optional[Path] = None
+    antechamber_format = "sdf"
+
+    if original_sdf is not None:
+        # Use SDF directly (preserves bond orders, critical for antechamber)
+        lig_input = work / "ligand_input.sdf"
+        shutil.copyfile(original_sdf, lig_input)
+        antechamber_input = lig_input
+        antechamber_format = "sdf"
+        (work / "ligand_source.txt").write_text(
+            f"Using original SDF: {original_sdf}\n"
+            f"This preserves bond order information for antechamber.\n"
+        )
+    else:
+        # LAST RESORT: convert PDBQT pose to SDF via obabel (preserves some bond info)
+        lig_input = work / "ligand_input.sdf"
+        rc, _ = _run_logged(
+            ["obabel", "-ipdbqt", str(pose_pdbqt), "-osdf", "-O", str(lig_input),
+             "-f", "1", "-l", "1", "-h"],
+            cwd=work, log_path=work / "obabel_pdbqt_to_sdf.log",
+            allow_fail=True,
+        )
+        if rc == 0 and lig_input.exists() and lig_input.stat().st_size > 0:
+            antechamber_input = lig_input
+            antechamber_format = "sdf"
+        else:
+            # Final fallback: use sanitized PDB (likely to fail for complex ligands)
+            antechamber_input = lig_pose_h
+            antechamber_format = "pdb"
+
+        (work / "ligand_source.txt").write_text(
+            f"WARNING: No original SDF found for ligand.\n"
+            f"Using: {antechamber_input} (format={antechamber_format})\n"
+            f"This may fail for ligands with complex bonding (e.g., phosphates).\n"
         )
 
-    def _do_antechamber_from_pose_pdb(method: str) -> None:
+    def _do_antechamber(method: str) -> None:
         _run_logged(
             [
                 "antechamber",
-                "-i", str(lig_pose_h),
-                "-fi", "pdb",
+                "-i", str(antechamber_input),
+                "-fi", antechamber_format,
                 "-o", str(lig_mol2),
                 "-fo", "mol2",
                 "-at", cfg.at_forcefield,
@@ -771,36 +798,27 @@ def run_one_mmgbsa(
                 "-nc", str(int(net_charge)),
                 "-s", "2",
             ],
-            cwd=work,
-            log_path=work / "antechamber.log",
+            cwd=work, log_path=work / "antechamber.log",
         )
 
     try:
-        if lig_src is not None:
-            _do_antechamber_from_sdf(cfg.charge_method)
-        else:
-            _do_antechamber_from_pose_pdb(cfg.charge_method)
+        _do_antechamber(cfg.charge_method)
     except Exception as e1:
         if (cfg.charge_method == "bcc") and (not cfg.no_gas_fallback):
             (work / "antechamber_fallback_reason.txt").write_text(
-                f"Primary antechamber failed with bcc. Error: {repr(e1)}\nTrying gas fallback.\n",
-                errors="ignore",
+                f"bcc failed: {repr(e1)}\nTrying gas fallback.\n"
             )
-            if lig_src is not None:
-                _do_antechamber_from_sdf("gas")
-            else:
-                _do_antechamber_from_pose_pdb("gas")
+            _do_antechamber("gas")
         else:
             raise
 
     _run_logged(
         ["parmchk2", "-i", str(lig_mol2), "-f", "mol2", "-o", str(lig_frcmod)],
-        cwd=work,
-        log_path=work / "parmchk2.log",
+        cwd=work, log_path=work / "parmchk2.log",
     )
 
     # -----------------------
-    # 5) Build ligand pose with correct names
+    # 5) Build ligand pose with correct atom names from mol2 template
     # -----------------------
     lig_tpl = _write_ligand_tpl_pdb_from_mol2(work)
     lig_pose_named = work / "ligand_pose_named.pdb"
@@ -813,7 +831,7 @@ def run_one_mmgbsa(
     _make_complex_pdb(receptor_amber_final, lig_pose_named, complex_pdb)
 
     # -----------------------
-    # 7) tleap build prmtop/inpcrd
+    # 7) tleap
     # -----------------------
     leap_in = _write_tleap_in(work, cfg)
     _run_logged(["tleap", "-f", str(leap_in)], cwd=work, log_path=work / "tleap.log")
@@ -821,82 +839,75 @@ def run_one_mmgbsa(
     for fn in ["receptor.prmtop", "ligand.prmtop", "complex.prmtop"]:
         ptop = work / fn
         if (not ptop.exists()) or ptop.stat().st_size < 1000:
-            raise RuntimeError(f"tleap did not generate a valid {fn}. See {work/'tleap.log'}")
+            raise RuntimeError(f"tleap failed to generate {fn}. See {work / 'tleap.log'}")
 
     # -----------------------
-    # 8) cpptraj -> 1-frame mdcrd
+    # 8) cpptraj
     # -----------------------
     cpp_in = _write_cpptraj_in(work)
     _run_logged(["cpptraj", "-i", str(cpp_in)], cwd=work, log_path=work / "cpptraj.log")
 
     # -----------------------
-    # 9) MMPBSA single-frame GBSA
+    # 9) MMPBSA
     # -----------------------
     mmp_in = _write_mmpbsa_in(work, cfg)
     _run_logged(
         [
-            "MMPBSA.py",
-            "-O",
+            "MMPBSA.py", "-O",
             "-i", str(mmp_in),
             "-cp", "complex.prmtop",
             "-rp", "receptor.prmtop",
             "-lp", "ligand.prmtop",
             "-y", "complex.mdcrd",
         ],
-        cwd=work,
-        log_path=work / "mmpbsa.log",
+        cwd=work, log_path=work / "mmpbsa.log",
     )
 
     final_dat = work / "FINAL_RESULTS_MMPBSA.dat"
     dg = _parse_mmpbsa_final_results(final_dat)
 
     rec = dict(job)
-    rec.update(
-        {
-            "mmgbsa_ok": bool(dg is not None),
-            "mmgbsa_dg_bind": dg if dg is not None else 1e9,
-            "mmgbsa_workdir": str(work),
-            "mmgbsa_final": str(final_dat) if final_dat.exists() else "",
-            "mmgbsa_log": str(work / "mmpbsa.log") if (work / "mmpbsa.log").exists() else "",
-            "mmgbsa_charge": int(net_charge),
-            "mmgbsa_charge_source": charge_source,
-            "mmgbsa_charge_method": cfg.charge_method,
-            "mmgbsa_igb": int(cfg.igb),
-            "mmgbsa_saltcon": float(cfg.saltcon),
-            "mmgbsa_ph": float(cfg.ph),
-        }
-    )
+    rec.update({
+        "mmgbsa_ok": bool(dg is not None),
+        "mmgbsa_dg_bind": dg if dg is not None else 1e9,
+        "mmgbsa_workdir": str(work),
+        "mmgbsa_final": str(final_dat) if final_dat.exists() else "",
+        "mmgbsa_log": str(work / "mmpbsa.log") if (work / "mmpbsa.log").exists() else "",
+        "mmgbsa_charge": int(net_charge),
+        "mmgbsa_charge_source": charge_source,
+        "mmgbsa_charge_method": cfg.charge_method,
+        "mmgbsa_igb": int(cfg.igb),
+        "mmgbsa_saltcon": float(cfg.saltcon),
+        "mmgbsa_ph": float(cfg.ph),
+    })
     if dg is None:
         rec["mmgbsa_ok"] = False
-        rec["mmgbsa_error"] = f"parse_failed: {final_dat}" if final_dat.exists() else "missing_final_results"
+        rec["mmgbsa_error"] = (
+            f"parse_failed: {final_dat}" if final_dat.exists()
+            else "missing_final_results"
+        )
     return rec
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="MM/GBSA rescoring with automatic charge detection from ligand ensemble"
+        description="MM/GBSA rescoring with automatic charge detection"
     )
-    ap.add_argument("--run_dir", type=str, required=True,
-                    help="Run directory containing ligand_ensemble/ and rescore/")
-    ap.add_argument("--iter", type=int, default=None,
-                    help="Iteration index (e.g., 1 for iter_001)")
-    ap.add_argument("--topN_csv", type=str, default=None,
-                    help="Override: create manifest from this topN.csv")
-    ap.add_argument("--iter_out", type=int, default=1,
-                    help="Output iteration index when using --topN_csv")
+    ap.add_argument("--run_dir", type=str, required=True)
+    ap.add_argument("--iter", type=int, default=None)
+    ap.add_argument("--topN_csv", type=str, default=None)
+    ap.add_argument("--iter_out", type=int, default=1)
     ap.add_argument("--overwrite_manifest", action="store_true")
-    ap.add_argument("--create_only", action="store_true",
-                    help="Only create manifest, don't run MM/GBSA")
+    ap.add_argument("--create_only", action="store_true")
     ap.add_argument("--workers", type=int, default=1)
-    ap.add_argument("--topM", type=int, default=None,
-                    help="Limit to top M jobs")
+    ap.add_argument("--topM", type=int, default=None)
     ap.add_argument("--igb", type=int, default=5)
     ap.add_argument("--saltcon", type=float, default=0.150)
     ap.add_argument("--ph", type=float, default=7.4)
     ap.add_argument("--charge_method", type=str, default="bcc", choices=["bcc", "gas"])
     ap.add_argument("--no_gas_fallback", action="store_true")
     ap.add_argument("--net_charge", type=int, default=None,
-                    help="Override ligand net charge (auto-detect from ligand_ensemble if not set)")
+                    help="Override ligand net charge (auto-detect if not set)")
     ap.add_argument("--keep_tmp", action="store_true")
     args = ap.parse_args()
 
@@ -904,20 +915,27 @@ def main() -> None:
     rescore_root = run_dir / "rescore"
     _safe_mkdir(rescore_root)
 
-    # Check for ligand ensemble charge info
-    ligand_manifest = run_dir / "ligand_ensemble" / "manifest.json"
-    if ligand_manifest.exists():
+    # Show charge info at startup
+    manifest_path = run_dir / "ligand_ensemble" / "manifest.json"
+    if manifest_path.exists():
         try:
-            manifest = json.loads(ligand_manifest.read_text())
-            charge_info = manifest.get("charge_info", {})
-            print(f"[mmgbsa] Ligand charge from ensemble: {charge_info.get('formal_charge', 'N/A')} "
-                  f"(method={charge_info.get('detection_method', 'N/A')}, "
-                  f"validation={'PASSED' if charge_info.get('validation_passed', True) else 'FAILED'})")
+            manifest = json.loads(manifest_path.read_text())
+            ci = manifest.get("charge_info", {})
+            print(f"[mmgbsa] Ligand charge from ensemble: {ci.get('formal_charge', 'N/A')} "
+                  f"(method={ci.get('detection_method', 'N/A')}, "
+                  f"validation={'PASSED' if ci.get('validation_passed', True) else 'FAILED'})")
         except Exception as e:
-            print(f"[mmgbsa] Warning: Could not read ligand_ensemble/manifest.json: {e}")
+            print(f"[mmgbsa] Warning: Could not read manifest: {e}")
     else:
-        print(f"[mmgbsa] Note: No ligand_ensemble/manifest.json found. "
-              f"Will attempt auto-detection from SDF/PDBQT.")
+        # Check charge.txt as simpler fallback
+        charge_txt = run_dir / "ligand_ensemble" / "charge.txt"
+        if charge_txt.exists():
+            print(f"[mmgbsa] Ligand charge from charge.txt: {charge_txt.read_text().strip()}")
+        else:
+            print("[mmgbsa] Note: No ligand_ensemble found. Will auto-detect charge per job.")
+
+    if args.net_charge is not None:
+        print(f"[mmgbsa] CLI override: --net_charge={args.net_charge}")
 
     # topN.csv -> manifest mode
     if args.topN_csv is not None:
@@ -980,16 +998,22 @@ def main() -> None:
         er["mmgbsa_workdir"] = workdir
         return er
 
+    print(f"[mmgbsa] Running {len(jobs)} jobs (workers={args.workers})")
+
     if int(args.workers) <= 1:
-        for j in jobs:
+        for idx, j in enumerate(jobs, 1):
+            print(f"[mmgbsa] --- job {idx}/{len(jobs)} seq={j.get('seq','')[:15]}... ---")
             try:
                 results.append(run_one_mmgbsa(j, out_dir, cfg, args.net_charge, run_dir))
             except Exception as e:
+                print(f"[mmgbsa] FAILED: {repr(e)[:120]}")
                 errors.append(_handle_err(j, e))
     else:
-        # Note: For parallel execution, we pass run_dir as a string
         with ProcessPoolExecutor(max_workers=int(args.workers)) as ex:
-            futs = {ex.submit(run_one_mmgbsa, j, out_dir, cfg, args.net_charge, run_dir): j for j in jobs}
+            futs = {
+                ex.submit(run_one_mmgbsa, j, out_dir, cfg, args.net_charge, run_dir): j
+                for j in jobs
+            }
             for fu in as_completed(futs):
                 j = futs[fu]
                 try:
@@ -1015,20 +1039,24 @@ def main() -> None:
     _write_jsonl(out_jsonl, merged)
     _write_csv(out_csv, merged, fields)
 
-    # Summary statistics
     n_ok = sum(1 for r in merged if r.get("mmgbsa_ok"))
     n_fail = len(merged) - n_ok
-    
+
     print(f"[mmgbsa] wrote: {out_jsonl}")
     print(f"[mmgbsa] wrote: {out_csv}")
-    print(f"[mmgbsa] summary: {n_ok} succeeded, {n_fail} failed")
-    
+    print(f"[mmgbsa] summary: {n_ok} succeeded, {n_fail} failed, total={len(merged)}")
+
     if merged:
         best = merged[0]
         if best.get("mmgbsa_ok"):
-            print(f"[mmgbsa] best dg_bind={best.get('mmgbsa_dg_bind'):.2f} seq={best.get('seq','')}")
+            print(f"[mmgbsa] best dg_bind={best.get('mmgbsa_dg_bind'):.2f} "
+                  f"seq={best.get('seq','')} charge_source={best.get('mmgbsa_charge_source','')}")
         else:
-            print(f"[mmgbsa] WARNING: best result also failed. Check logs.")
+            print("[mmgbsa] WARNING: All jobs failed. Check antechamber.log and tleap.log")
+            # Show first error for quick diagnosis
+            first_err = next((r for r in merged if r.get("mmgbsa_error")), None)
+            if first_err:
+                print(f"[mmgbsa] First error: {str(first_err.get('mmgbsa_error',''))[:200]}")
         print(f"[mmgbsa] best workdir={best.get('mmgbsa_workdir','')}")
 
 
