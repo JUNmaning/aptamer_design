@@ -212,7 +212,7 @@ If you need to re-run MMGBSA with a different charge without regenerating confor
 
 ## 5) How to run (production)
 
-### Standard workflow (recommended)
+### Standard workflow 
 
     cd ~/autodl-tmp/aptamer_design
 
@@ -228,7 +228,7 @@ If you need to re-run MMGBSA with a different charge without regenerating confor
     # Step 3: Run the full CE + GBSA feedback loop
     bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
 
-### One-line command (charge + run)
+### One-line command 
 
     python ligand/rdkit_conformers.py data/PFHxS.sdf \
         --out_dir runs/ce_run1/ligand_ensemble \
@@ -299,8 +299,7 @@ Check which criterion stopped the run:
 
 ---
 
-## 6) Quick Start (5-minute test)
-
+## 6) Quick Start 
     cd ~/autodl-tmp/aptamer_design
 
     # 1. Prepare ligand
