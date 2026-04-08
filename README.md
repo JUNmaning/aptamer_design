@@ -445,23 +445,11 @@ Controls MMGBSA rescoring and feedback selection.
   Whether penalty/failure candidates are allowed into rescoring.  
   Usually set to `false`.
 
-- `topM` *(optional)*  
-  Fixed number of top docking candidates selected for MMGBSA rescoring.
-
 - `top_frac` *(optional)*  
   Fraction of the CE batch selected for MMGBSA rescoring.
 
-  If `top_frac` is provided, the outer loop script typically computes:
-  `topM = ceil(batch * top_frac)`
-
-- `elite_n` *(optional)*  
-  Fixed number of MMGBSA-rescored candidates used for feedback update.
-
 - `elite_frac` *(optional)*  
   Fraction of the MMGBSA candidate set used for feedback update.
-
-  If `elite_frac` is provided, the outer loop script typically computes:
-  `elite_n = ceil(topM * elite_frac)`
 
 **Typical logic:**  
 1. CE evaluates a batch with docking  
