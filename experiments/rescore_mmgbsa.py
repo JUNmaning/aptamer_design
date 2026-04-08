@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+MM/GBSA rescoring for aptamer-ligand complexes.
+
+This module reads ligand charge from the normalized manifest (created by
+ligand/rdkit_conformers.py) to ensure consistent parameterization.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+# Import charge utilities from ligand module
+try:
+    from ligand.rdkit_conformers import (
+        get_ligand_charge_auto,
+        get_ligand_charge_from_manifest,
+        compute_ligand_charge_info,
+    )
+    HAS_LIGAND_MODULE = True
+except ImportError:
+    HAS_LIGAND_MODULE = False
 
 
 # -----------------------
@@ -89,8 +107,7 @@ def _write_csv(path: Path, rows: List[Dict], fieldnames: List[str]) -> None:
 
 def _jobs_from_topN_csv(topn_csv: Path, topM: Optional[int] = None) -> List[Dict]:
     """
-    Optional mode: create a manifest directly from topN.csv.
-    In the CE pipeline, the preferred mode is manifest.jsonl generated under rescore/iter_xxx/.
+    Create job manifest from topN.csv.
     """
     if not topn_csv.exists():
         raise FileNotFoundError(f"topN.csv not found: {topn_csv}")
@@ -280,7 +297,6 @@ def _pdb_element(ln: str) -> str:
     name = re.sub(r"\d+", "", name)
     if not name:
         return ""
-    # Common cases: "Cl", "Br"
     if len(name) >= 2 and name[0].isalpha() and name[1].islower():
         return (name[0] + name[1]).upper()
     return name[0].upper()
@@ -323,10 +339,7 @@ def _inject_pose_coords_to_tpl(
     out_pdb: Path,
 ) -> None:
     """
-    Inject dock pose coordinates into the ligand template PDB (names/types from template are preserved).
-
-    If atom counts mismatch (commonly due to missing H in pose), we inject only heavy-atom coordinates
-    and keep hydrogen coordinates from the template.
+    Inject dock pose coordinates into the ligand template PDB.
     """
     tpl_lines = _pdb_atom_lines(tpl_pdb)
     pose_lines = _pdb_atom_lines(pose_pdb)
@@ -360,9 +373,10 @@ def _inject_pose_coords_to_tpl(
 
 
 # -----------------------
-# charge detection
+# charge detection (multiple methods with priority)
 # -----------------------
 def _detect_net_charge_from_pdbqt(pdbqt: Path) -> Optional[int]:
+    """Detect charge from PDBQT Gasteiger charges (last resort)."""
     try:
         s = 0.0
         n = 0
@@ -383,6 +397,119 @@ def _detect_net_charge_from_pdbqt(pdbqt: Path) -> Optional[int]:
         return int(round(s))
     except Exception:
         return None
+
+
+def _detect_net_charge_from_sdf_rdkit(sdf_path: Path) -> Optional[int]:
+    """Detect formal charge using RDKit (reliable)."""
+    try:
+        from rdkit import Chem
+        suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+        if suppl and len(suppl) > 0:
+            mol = suppl[0]
+            if mol:
+                return Chem.GetFormalCharge(mol)
+    except Exception:
+        pass
+    return None
+
+
+def _detect_net_charge_from_sdf_property(sdf_path: Path) -> Optional[int]:
+    """Read NET_CHARGE property from SDF (written by our ligand prep)."""
+    try:
+        from rdkit import Chem
+        suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+        if suppl and len(suppl) > 0:
+            mol = suppl[0]
+            if mol and mol.HasProp("NET_CHARGE"):
+                return mol.GetIntProp("NET_CHARGE")
+    except Exception:
+        pass
+    return None
+
+
+def determine_ligand_charge(
+    job: Dict,
+    run_dir: Path,
+    net_charge_override: Optional[int],
+    work: Path,
+) -> Tuple[int, str]:
+    """
+    Determine ligand charge using multiple sources with priority:
+    
+    1. Command-line override (--net_charge)
+    2. Ligand ensemble manifest (most reliable)
+    3. SDF NET_CHARGE property (from our prep)
+    4. RDKit formal charge from ligand SDF
+    5. PDBQT Gasteiger sum (least reliable)
+    6. Fallback to 0
+    
+    Returns:
+        (charge, source): The charge and detection source for logging.
+    """
+    # Priority 1: Command-line override
+    if net_charge_override is not None:
+        return int(net_charge_override), "cli_override"
+    
+    # Priority 2: Ligand ensemble manifest
+    ligand_manifest = run_dir / "ligand_ensemble" / "manifest.json"
+    if ligand_manifest.exists():
+        try:
+            manifest = json.loads(ligand_manifest.read_text())
+            charge_info = manifest.get("charge_info", {})
+            if "formal_charge" in charge_info:
+                charge = int(charge_info["formal_charge"])
+                # Log validation status
+                if not charge_info.get("validation_passed", True):
+                    (work / "charge_warning.txt").write_text(
+                        f"Charge validation warning: {charge_info.get('validation_notes', 'unknown')}\n"
+                    )
+                return charge, "manifest"
+        except Exception:
+            pass
+    
+    # Priority 3: charge.json in ligand_ensemble
+    charge_json = run_dir / "ligand_ensemble" / "charge.json"
+    if charge_json.exists():
+        try:
+            info = json.loads(charge_json.read_text())
+            if "formal_charge" in info:
+                return int(info["formal_charge"]), "charge_json"
+        except Exception:
+            pass
+    
+    # Priority 4: SDF NET_CHARGE property from ligand_sdf in job
+    ligand_sdf = job.get("best_ligand_sdf") or job.get("ligand_sdf") or ""
+    if ligand_sdf:
+        sdf_path = Path(ligand_sdf)
+        if sdf_path.exists():
+            charge = _detect_net_charge_from_sdf_property(sdf_path)
+            if charge is not None:
+                return charge, "sdf_property"
+    
+    # Priority 5: RDKit formal charge from ligand SDF
+    if ligand_sdf:
+        sdf_path = Path(ligand_sdf)
+        if sdf_path.exists():
+            charge = _detect_net_charge_from_sdf_rdkit(sdf_path)
+            if charge is not None:
+                return charge, "rdkit_formal"
+    
+    # Priority 6: PDBQT Gasteiger sum
+    pose_pdbqt = job.get("best_dock_pose_pdbqt") or job.get("pose_pdbqt") or ""
+    if pose_pdbqt:
+        pdbqt_path = Path(pose_pdbqt)
+        if pdbqt_path.exists():
+            charge = _detect_net_charge_from_pdbqt(pdbqt_path)
+            if charge is not None:
+                return charge, "pdbqt_gasteiger"
+    
+    # Fallback
+    (work / "charge_warning.txt").write_text(
+        "WARNING: Could not auto-detect ligand charge from any source.\n"
+        "Defaulting to 0. If ligand is charged, set --net_charge explicitly.\n"
+        f"Searched: manifest, charge.json, sdf_property, rdkit, pdbqt\n"
+    )
+    return 0, "fallback"
 
 
 # -----------------------
@@ -490,7 +617,7 @@ def _pick_job_paths(job: Dict) -> Tuple[Path, Path]:
     rec = job.get("best_receptor_pdb") or job.get("receptor_pdb") or ""
     pose = job.get("best_dock_pose_pdbqt") or job.get("pose_pdbqt") or ""
     if not rec or not pose:
-        raise KeyError("Job missing receptor/pose path. Need receptor_pdb and pose_pdbqt (or best_* equivalents).")
+        raise KeyError("Job missing receptor/pose path. Need receptor_pdb and pose_pdbqt.")
     return Path(rec).expanduser().resolve(), Path(pose).expanduser().resolve()
 
 
@@ -504,7 +631,13 @@ def _pick_ligand_source(job: Dict) -> Optional[Path]:
     return p if p.exists() else None
 
 
-def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_override: Optional[int]) -> Dict:
+def run_one_mmgbsa(
+    job: Dict,
+    out_dir: Path,
+    cfg: MMGBSAConfig,
+    net_charge_override: Optional[int],
+    run_dir: Path,
+) -> Dict:
     _require_exe("obabel")
     _require_exe("pdb4amber")
     _require_exe("antechamber")
@@ -559,7 +692,6 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
     )
     _sanitize_ligand_pdb(lig_pose_raw, lig_pose_sane, resname="LIG", chain="Z")
 
-    # Try to add H to the pose (may fail; heavy-atom-only injection is supported later)
     _run_logged(
         ["obabel", "-ipdb", str(lig_pose_sane), "-opdb", "-O", str(lig_pose_h), "-p", f"{cfg.ph:.2f}"],
         cwd=work,
@@ -570,21 +702,31 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
         shutil.copyfile(lig_pose_sane, lig_pose_h)
 
     # -----------------------
-    # 3) ligand parameterization (IMPORTANT: use original ligand file if available)
+    # 3) Determine ligand charge (IMPROVED: use normalized charge)
     # -----------------------
-    if net_charge_override is not None:
-        net_charge = int(net_charge_override)
-    else:
-        net_charge = _detect_net_charge_from_pdbqt(pose_pdbqt)
-        if net_charge is None:
-            net_charge = 0
+    net_charge, charge_source = determine_ligand_charge(
+        job=job,
+        run_dir=run_dir,
+        net_charge_override=net_charge_override,
+        work=work,
+    )
+    
+    # Log charge determination
+    charge_log = work / "charge_detection.log"
+    charge_log.write_text(
+        f"Net charge: {net_charge}\n"
+        f"Source: {charge_source}\n"
+        f"Override: {net_charge_override}\n"
+    )
+    print(f"[mmgbsa] rank={rank} charge={net_charge} (source={charge_source})")
 
+    # -----------------------
+    # 4) ligand parameterization
+    # -----------------------
     lig_src = _pick_ligand_source(job)
     lig_input = work / "ligand_input.sdf"
 
     if lig_src is not None:
-        # Convert to SDF with explicit hydrogens when possible
-        # This preserves bond order better than PDB derived from docking.
         _run_logged(
             ["obabel", str(lig_src), "-O", str(lig_input), "-h"],
             cwd=work,
@@ -592,10 +734,8 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
             allow_fail=True,
         )
         if (not lig_input.exists()) or lig_input.stat().st_size == 0:
-            # Fallback: just copy the source
             shutil.copyfile(lig_src, lig_input)
     else:
-        # Fallback: use pose PDB (less reliable)
         shutil.copyfile(lig_pose_h, lig_input)
 
     lig_mol2 = work / "ligand.mol2"
@@ -619,7 +759,6 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
         )
 
     def _do_antechamber_from_pose_pdb(method: str) -> None:
-        # Last-resort fallback; may fail for ligands requiring correct bond orders.
         _run_logged(
             [
                 "antechamber",
@@ -661,20 +800,20 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
     )
 
     # -----------------------
-    # 4) Build ligand pose with correct names (template from ligand.mol2 + inject dock coords)
+    # 5) Build ligand pose with correct names
     # -----------------------
     lig_tpl = _write_ligand_tpl_pdb_from_mol2(work)
     lig_pose_named = work / "ligand_pose_named.pdb"
     _inject_pose_coords_to_tpl(lig_tpl, lig_pose_h, lig_pose_named)
 
     # -----------------------
-    # 5) complex.pdb uses receptor_amber_final + ligand_pose_named
+    # 6) complex.pdb
     # -----------------------
     complex_pdb = work / "complex.pdb"
     _make_complex_pdb(receptor_amber_final, lig_pose_named, complex_pdb)
 
     # -----------------------
-    # 6) tleap build prmtop/inpcrd
+    # 7) tleap build prmtop/inpcrd
     # -----------------------
     leap_in = _write_tleap_in(work, cfg)
     _run_logged(["tleap", "-f", str(leap_in)], cwd=work, log_path=work / "tleap.log")
@@ -685,13 +824,13 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
             raise RuntimeError(f"tleap did not generate a valid {fn}. See {work/'tleap.log'}")
 
     # -----------------------
-    # 7) cpptraj -> 1-frame mdcrd
+    # 8) cpptraj -> 1-frame mdcrd
     # -----------------------
     cpp_in = _write_cpptraj_in(work)
     _run_logged(["cpptraj", "-i", str(cpp_in)], cwd=work, log_path=work / "cpptraj.log")
 
     # -----------------------
-    # 8) MMPBSA single-frame GBSA
+    # 9) MMPBSA single-frame GBSA
     # -----------------------
     mmp_in = _write_mmpbsa_in(work, cfg)
     _run_logged(
@@ -720,6 +859,7 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
             "mmgbsa_final": str(final_dat) if final_dat.exists() else "",
             "mmgbsa_log": str(work / "mmpbsa.log") if (work / "mmpbsa.log").exists() else "",
             "mmgbsa_charge": int(net_charge),
+            "mmgbsa_charge_source": charge_source,
             "mmgbsa_charge_method": cfg.charge_method,
             "mmgbsa_igb": int(cfg.igb),
             "mmgbsa_saltcon": float(cfg.saltcon),
@@ -733,27 +873,51 @@ def run_one_mmgbsa(job: Dict, out_dir: Path, cfg: MMGBSAConfig, net_charge_overr
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--run_dir", type=str, required=True)
-    ap.add_argument("--iter", type=int, default=None)
-    ap.add_argument("--topN_csv", type=str, default=None)
-    ap.add_argument("--iter_out", type=int, default=1)
+    ap = argparse.ArgumentParser(
+        description="MM/GBSA rescoring with automatic charge detection from ligand ensemble"
+    )
+    ap.add_argument("--run_dir", type=str, required=True,
+                    help="Run directory containing ligand_ensemble/ and rescore/")
+    ap.add_argument("--iter", type=int, default=None,
+                    help="Iteration index (e.g., 1 for iter_001)")
+    ap.add_argument("--topN_csv", type=str, default=None,
+                    help="Override: create manifest from this topN.csv")
+    ap.add_argument("--iter_out", type=int, default=1,
+                    help="Output iteration index when using --topN_csv")
     ap.add_argument("--overwrite_manifest", action="store_true")
-    ap.add_argument("--create_only", action="store_true")
+    ap.add_argument("--create_only", action="store_true",
+                    help="Only create manifest, don't run MM/GBSA")
     ap.add_argument("--workers", type=int, default=1)
-    ap.add_argument("--topM", type=int, default=None)
+    ap.add_argument("--topM", type=int, default=None,
+                    help="Limit to top M jobs")
     ap.add_argument("--igb", type=int, default=5)
     ap.add_argument("--saltcon", type=float, default=0.150)
     ap.add_argument("--ph", type=float, default=7.4)
     ap.add_argument("--charge_method", type=str, default="bcc", choices=["bcc", "gas"])
     ap.add_argument("--no_gas_fallback", action="store_true")
-    ap.add_argument("--net_charge", type=int, default=None)
+    ap.add_argument("--net_charge", type=int, default=None,
+                    help="Override ligand net charge (auto-detect from ligand_ensemble if not set)")
     ap.add_argument("--keep_tmp", action="store_true")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).expanduser().resolve()
     rescore_root = run_dir / "rescore"
     _safe_mkdir(rescore_root)
+
+    # Check for ligand ensemble charge info
+    ligand_manifest = run_dir / "ligand_ensemble" / "manifest.json"
+    if ligand_manifest.exists():
+        try:
+            manifest = json.loads(ligand_manifest.read_text())
+            charge_info = manifest.get("charge_info", {})
+            print(f"[mmgbsa] Ligand charge from ensemble: {charge_info.get('formal_charge', 'N/A')} "
+                  f"(method={charge_info.get('detection_method', 'N/A')}, "
+                  f"validation={'PASSED' if charge_info.get('validation_passed', True) else 'FAILED'})")
+        except Exception as e:
+            print(f"[mmgbsa] Warning: Could not read ligand_ensemble/manifest.json: {e}")
+    else:
+        print(f"[mmgbsa] Note: No ligand_ensemble/manifest.json found. "
+              f"Will attempt auto-detection from SDF/PDBQT.")
 
     # topN.csv -> manifest mode
     if args.topN_csv is not None:
@@ -819,12 +983,13 @@ def main() -> None:
     if int(args.workers) <= 1:
         for j in jobs:
             try:
-                results.append(run_one_mmgbsa(j, out_dir, cfg, args.net_charge))
+                results.append(run_one_mmgbsa(j, out_dir, cfg, args.net_charge, run_dir))
             except Exception as e:
                 errors.append(_handle_err(j, e))
     else:
+        # Note: For parallel execution, we pass run_dir as a string
         with ProcessPoolExecutor(max_workers=int(args.workers)) as ex:
-            futs = {ex.submit(run_one_mmgbsa, j, out_dir, cfg, args.net_charge): j for j in jobs}
+            futs = {ex.submit(run_one_mmgbsa, j, out_dir, cfg, args.net_charge, run_dir): j for j in jobs}
             for fu in as_completed(futs):
                 j = futs[fu]
                 try:
@@ -841,7 +1006,7 @@ def main() -> None:
     fields = [
         "seq", "rank", "best_frame", "score_vina",
         "mmgbsa_dg_bind", "mmgbsa_ok",
-        "mmgbsa_charge", "mmgbsa_charge_method",
+        "mmgbsa_charge", "mmgbsa_charge_source", "mmgbsa_charge_method",
         "mmgbsa_igb", "mmgbsa_saltcon", "mmgbsa_ph",
         "receptor_pdb", "pose_pdbqt",
         "mmgbsa_workdir", "mmgbsa_final", "mmgbsa_log", "mmgbsa_error",
@@ -850,11 +1015,20 @@ def main() -> None:
     _write_jsonl(out_jsonl, merged)
     _write_csv(out_csv, merged, fields)
 
+    # Summary statistics
+    n_ok = sum(1 for r in merged if r.get("mmgbsa_ok"))
+    n_fail = len(merged) - n_ok
+    
     print(f"[mmgbsa] wrote: {out_jsonl}")
     print(f"[mmgbsa] wrote: {out_csv}")
+    print(f"[mmgbsa] summary: {n_ok} succeeded, {n_fail} failed")
+    
     if merged:
         best = merged[0]
-        print(f"[mmgbsa] best dg_bind={best.get('mmgbsa_dg_bind')} seq={best.get('seq','')}")
+        if best.get("mmgbsa_ok"):
+            print(f"[mmgbsa] best dg_bind={best.get('mmgbsa_dg_bind'):.2f} seq={best.get('seq','')}")
+        else:
+            print(f"[mmgbsa] WARNING: best result also failed. Check logs.")
         print(f"[mmgbsa] best workdir={best.get('mmgbsa_workdir','')}")
 
 
