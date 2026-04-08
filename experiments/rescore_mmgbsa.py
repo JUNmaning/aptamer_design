@@ -8,6 +8,7 @@ Key improvements over original:
   - Always prefer original SDF for antechamber (not PDBQT-derived PDB)
   - Robust fallback chain for charge detection
   - Better error diagnostics
+  - Fix MOL2 residue name mismatch (MOL -> LIG)
 """
 
 from __future__ import annotations
@@ -336,6 +337,53 @@ def _inject_pose_coords_to_tpl(tpl_pdb: Path, pose_pdb: Path, out_pdb: Path) -> 
     out_pdb.write_text("\n".join([ln.rstrip() for ln in out]) + "\n", errors="ignore")
 
 
+def _fix_mol2_resname(mol2_path: Path, new_resname: str = "LIG") -> None:
+    """
+    Fix residue name in MOL2 file for tleap compatibility.
+    
+    Antechamber sometimes outputs 'MOL' or other residue names, but our
+    complex.pdb uses 'LIG', so we need to match them to avoid tleap errors.
+    
+    Args:
+        mol2_path: Path to the MOL2 file to fix
+        new_resname: New residue name (default: "LIG")
+    """
+    if not mol2_path.exists():
+        return
+    
+    lines = mol2_path.read_text(errors="ignore").splitlines()
+    out_lines: List[str] = []
+    in_atom_section = False
+    
+    for line in lines:
+        if line.strip().startswith("@<TRIPOS>ATOM"):
+            in_atom_section = True
+            out_lines.append(line)
+            continue
+        elif line.strip().startswith("@<TRIPOS>"):
+            in_atom_section = False
+            out_lines.append(line)
+            continue
+        
+        if in_atom_section:
+            parts = line.split()
+            if len(parts) >= 8:
+                parts[7] = new_resname
+                try:
+                    line = "{:>7s} {:<8s} {:>13s} {:>9s} {:>9s} {:<5s} {:>5s} {:<8s}".format(
+                        parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
+                    )
+                    if len(parts) > 8:
+                        line += " " + " ".join(parts[8:])
+                except (ValueError, IndexError):
+                    parts[7] = new_resname
+                    line = " ".join(parts)
+        
+        out_lines.append(line)
+    
+    mol2_path.write_text("\n".join(out_lines) + "\n", errors="ignore")
+
+
 # -----------------------
 # charge detection
 # -----------------------
@@ -409,11 +457,9 @@ def determine_ligand_charge(
       8. PDBQT Gasteiger sum
       9. Fallback 0
     """
-    # 1) CLI override
     if net_charge_override is not None:
         return int(net_charge_override), "cli_override"
 
-    # 2) manifest.json
     manifest_path = run_dir / "ligand_ensemble" / "manifest.json"
     if manifest_path.exists():
         try:
@@ -429,7 +475,6 @@ def determine_ligand_charge(
         except Exception:
             pass
 
-    # 3) charge.json
     cj = run_dir / "ligand_ensemble" / "charge.json"
     if cj.exists():
         try:
@@ -439,7 +484,6 @@ def determine_ligand_charge(
         except Exception:
             pass
 
-    # 4) charge.txt
     ct = run_dir / "ligand_ensemble" / "charge.txt"
     if ct.exists():
         try:
@@ -447,7 +491,6 @@ def determine_ligand_charge(
         except Exception:
             pass
 
-    # 5-6) From job ligand_sdf
     ligand_sdf = job.get("best_ligand_sdf") or job.get("ligand_sdf") or ""
     if ligand_sdf:
         sdf_path = Path(ligand_sdf)
@@ -459,7 +502,6 @@ def determine_ligand_charge(
             if c is not None:
                 return c, "rdkit_formal"
 
-    # 7) From original ligand file in data/
     for orig in [
         run_dir / "data" / "ligand.sdf",
         Path("data/ligand.sdf").resolve(),
@@ -470,7 +512,6 @@ def determine_ligand_charge(
             if c is not None:
                 return c, f"rdkit_original({orig.name})"
 
-    # 8) PDBQT
     pose_pdbqt = job.get("best_dock_pose_pdbqt") or job.get("pose_pdbqt") or ""
     if pose_pdbqt:
         pp = Path(pose_pdbqt)
@@ -479,7 +520,6 @@ def determine_ligand_charge(
             if c is not None:
                 return c, "pdbqt_gasteiger"
 
-    # 9) Fallback
     (work / "charge_warning.txt").write_text(
         "WARNING: Could not auto-detect ligand charge from any source.\n"
         "Defaulting to 0. If ligand is charged, set --net_charge explicitly.\n"
@@ -490,17 +530,7 @@ def determine_ligand_charge(
 def _find_original_ligand_sdf(job: Dict, run_dir: Path) -> Optional[Path]:
     """
     Find the ORIGINAL ligand SDF file (with correct bond orders).
-    
-    This is CRITICAL: antechamber must use the original SDF, not
-    a PDBQT-derived PDB which loses bond order information.
-    
-    Search order:
-      1. job['best_ligand_sdf'] / job['ligand_sdf']
-      2. ligand_ensemble/conf_001.sdf (first conformer)
-      3. data/ligand.sdf (original input)
-      4. inputs.ligand from config
     """
-    # 1) From job record
     for key in ["best_ligand_sdf", "ligand_sdf"]:
         val = (job.get(key) or "").strip()
         if val:
@@ -508,10 +538,8 @@ def _find_original_ligand_sdf(job: Dict, run_dir: Path) -> Optional[Path]:
             if p.exists() and p.stat().st_size > 0:
                 return p
 
-    # 2) From ligand ensemble (generated conformers have correct bond orders)
     ensemble_dir = run_dir / "ligand_ensemble"
     if ensemble_dir.exists():
-        # Try manifest first
         manifest_path = ensemble_dir / "manifest.json"
         if manifest_path.exists():
             try:
@@ -523,12 +551,10 @@ def _find_original_ligand_sdf(job: Dict, run_dir: Path) -> Optional[Path]:
                         return p
             except Exception:
                 pass
-        # Try first conf file
         conf1 = ensemble_dir / "conf_001.sdf"
         if conf1.exists():
             return conf1
 
-    # 3) Original input
     for candidate in [
         run_dir / "data" / "ligand.sdf",
         Path("data/ligand.sdf").resolve(),
@@ -536,7 +562,6 @@ def _find_original_ligand_sdf(job: Dict, run_dir: Path) -> Optional[Path]:
         if candidate.exists() and candidate.stat().st_size > 0:
             return candidate
 
-    # 4) Check config
     resolved_cfg = run_dir / "resolved_config.yaml"
     if resolved_cfg.exists():
         try:
@@ -703,7 +728,7 @@ def run_one_mmgbsa(
         shutil.copyfile(receptor_amber_tmp, receptor_amber_final)
 
     # -----------------------
-    # 2) ligand pose prep (pdbqt -> pdb for coordinates only)
+    # 2) ligand pose prep
     # -----------------------
     lig_pose_raw = work / "ligand_pose_raw.pdb"
     lig_pose_sane = work / "ligand_pose.pdb"
@@ -741,19 +766,17 @@ def run_one_mmgbsa(
     print(f"[mmgbsa] rank={rank} charge={net_charge} (source={charge_source})")
 
     # -----------------------
-    # 4) ligand parameterization - MUST use original SDF, NOT pdbqt-derived PDB
+    # 4) ligand parameterization
     # -----------------------
     lig_mol2 = work / "ligand.mol2"
     lig_frcmod = work / "ligand.frcmod"
 
-    # Find the best source for antechamber (SDF with correct bond orders)
     original_sdf = _find_original_ligand_sdf(job, run_dir)
 
     antechamber_input: Optional[Path] = None
     antechamber_format = "sdf"
 
     if original_sdf is not None:
-        # Use SDF directly (preserves bond orders, critical for antechamber)
         lig_input = work / "ligand_input.sdf"
         shutil.copyfile(original_sdf, lig_input)
         antechamber_input = lig_input
@@ -763,7 +786,6 @@ def run_one_mmgbsa(
             f"This preserves bond order information for antechamber.\n"
         )
     else:
-        # LAST RESORT: convert PDBQT pose to SDF via obabel (preserves some bond info)
         lig_input = work / "ligand_input.sdf"
         rc, _ = _run_logged(
             ["obabel", "-ipdbqt", str(pose_pdbqt), "-osdf", "-O", str(lig_input),
@@ -775,14 +797,13 @@ def run_one_mmgbsa(
             antechamber_input = lig_input
             antechamber_format = "sdf"
         else:
-            # Final fallback: use sanitized PDB (likely to fail for complex ligands)
             antechamber_input = lig_pose_h
             antechamber_format = "pdb"
 
         (work / "ligand_source.txt").write_text(
             f"WARNING: No original SDF found for ligand.\n"
             f"Using: {antechamber_input} (format={antechamber_format})\n"
-            f"This may fail for ligands with complex bonding (e.g., phosphates).\n"
+            f"This may fail for ligands with complex bonding.\n"
         )
 
     def _do_antechamber(method: str) -> None:
@@ -817,8 +838,11 @@ def run_one_mmgbsa(
         cwd=work, log_path=work / "parmchk2.log",
     )
 
+    # Fix residue name in mol2 to match complex.pdb
+    _fix_mol2_resname(lig_mol2, new_resname="LIG")
+
     # -----------------------
-    # 5) Build ligand pose with correct atom names from mol2 template
+    # 5) Build ligand pose with correct atom names
     # -----------------------
     lig_tpl = _write_ligand_tpl_pdb_from_mol2(work)
     lig_pose_named = work / "ligand_pose_named.pdb"
@@ -915,7 +939,6 @@ def main() -> None:
     rescore_root = run_dir / "rescore"
     _safe_mkdir(rescore_root)
 
-    # Show charge info at startup
     manifest_path = run_dir / "ligand_ensemble" / "manifest.json"
     if manifest_path.exists():
         try:
@@ -927,7 +950,6 @@ def main() -> None:
         except Exception as e:
             print(f"[mmgbsa] Warning: Could not read manifest: {e}")
     else:
-        # Check charge.txt as simpler fallback
         charge_txt = run_dir / "ligand_ensemble" / "charge.txt"
         if charge_txt.exists():
             print(f"[mmgbsa] Ligand charge from charge.txt: {charge_txt.read_text().strip()}")
@@ -937,7 +959,6 @@ def main() -> None:
     if args.net_charge is not None:
         print(f"[mmgbsa] CLI override: --net_charge={args.net_charge}")
 
-    # topN.csv -> manifest mode
     if args.topN_csv is not None:
         topn_csv = Path(args.topN_csv).expanduser()
         if not topn_csv.is_absolute():
@@ -1053,7 +1074,6 @@ def main() -> None:
                   f"seq={best.get('seq','')} charge_source={best.get('mmgbsa_charge_source','')}")
         else:
             print("[mmgbsa] WARNING: All jobs failed. Check antechamber.log and tleap.log")
-            # Show first error for quick diagnosis
             first_err = next((r for r in merged if r.get("mmgbsa_error")), None)
             if first_err:
                 print(f"[mmgbsa] First error: {str(first_err.get('mmgbsa_error',''))[:200]}")
