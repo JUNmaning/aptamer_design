@@ -84,17 +84,11 @@ def get_probs(dist: SequenceDistribution) -> np.ndarray:
 
 
 def set_probs(dist: SequenceDistribution, P: np.ndarray) -> None:
-    """
-    Set distribution by writing logits = log(P).
-    Works with the canonical SequenceDistribution(logits ndarray).
-    Also tries a few fallbacks for slightly different implementations.
-    """
     P = np.asarray(P, dtype=float)
     eps = 1e-12
     P = np.clip(P, eps, 1.0)
     logits = np.log(P)
 
-    # common names
     for name in ["logits", "_logits", "theta", "_theta"]:
         if hasattr(dist, name):
             try:
@@ -103,7 +97,6 @@ def set_probs(dist: SequenceDistribution, P: np.ndarray) -> None:
             except Exception:
                 pass
 
-    # scan for ndarray-like attribute with same shape
     for name in dir(dist):
         if name.startswith("_") and name not in ["_logits", "_theta"]:
             continue
@@ -136,10 +129,6 @@ def dist_stats(dist: SequenceDistribution) -> Dict[str, float]:
 
 
 def apply_uniform_mix_entropy_regularization(dist: SequenceDistribution, mix: float) -> None:
-    """
-    Explicit entropy / exploration regularization:
-    P <- (1-mix) P + mix * Uniform
-    """
     mix = float(mix)
     if mix <= 0:
         return
@@ -159,9 +148,6 @@ def hamming_norm(a: str, b: str) -> float:
 
 
 def dotbracket_pairs(db: str) -> set[tuple[int, int]]:
-    """
-    Convert dot-bracket to base-pair set.
-    """
     stack = []
     pairs = set()
     for i, ch in enumerate(db):
@@ -175,17 +161,10 @@ def dotbracket_pairs(db: str) -> set[tuple[int, int]]:
 
 
 def struct_distance(db1: Optional[str], db2: Optional[str], metric: str = "bp") -> float:
-    """
-    Structural distance in [0,1]. If missing dotbracket -> treat as far (1.0).
-    metric:
-      - "bp": 1 - Jaccard(pairs)
-      - "edit": normalized character mismatch (same as hamming on dot-bracket)
-    """
     if not db1 or not db2:
         return 1.0
     if metric == "edit":
         return hamming_norm(db1, db2)
-    # default "bp"
     p1 = dotbracket_pairs(db1)
     p2 = dotbracket_pairs(db2)
     if not p1 and not p2:
@@ -205,18 +184,9 @@ def select_elites_with_constraints(
     struct_min_dist: float,
     logger,
 ) -> Tuple[List[Dict], Dict[str, float], List[Dict]]:
-    """
-    Elite selection that enforces:
-      - sequence diversity (min normalized Hamming to previously selected elites)
-      - optional structural diversity (min distance between dot-brackets, or uniqueness)
-
-    If not enough elites, relax in stages, and LOG each relaxation stage.
-    Returns: (elites, metrics, stage_log)
-    """
     elite_n = max(1, int(elite_n))
     stage_log: List[Dict] = []
 
-    # relaxation schedule: reduce struct_min_dist -> disable struct_unique -> reduce min_hamming
     cur_struct_min = float(struct_min_dist)
     cur_struct_unique = bool(struct_unique)
     cur_min_ham = float(min_hamming)
@@ -238,12 +208,10 @@ def select_elites_with_constraints(
 
             ok = True
 
-            # hamming constraint vs picked_seqs
             if picked_seqs and cur_min_ham_ > 0:
                 if min(hamming_norm(s, t) for t in picked_seqs) < cur_min_ham_:
                     ok = False
 
-            # structural constraints
             if ok and cur_struct_unique_:
                 if db and db in seen_db:
                     ok = False
@@ -262,7 +230,6 @@ def select_elites_with_constraints(
 
         return picked
 
-    # iterative relax
     max_rounds = 12
     for r in range(max_rounds):
         elites = try_pick(cur_min_ham, cur_struct_unique, cur_struct_min)
@@ -278,7 +245,6 @@ def select_elites_with_constraints(
         if len(elites) >= elite_n:
             break
 
-        # relax in priority order
         if cur_struct_min > 0:
             cur_struct_min = max(0.0, cur_struct_min * 0.8)
             continue
@@ -290,7 +256,6 @@ def select_elites_with_constraints(
             continue
         break
 
-    # log fallback process (paper/答辩可用)
     if logger is not None:
         msg = "elite_fallback:"
         for st in stage_log:
@@ -298,7 +263,6 @@ def select_elites_with_constraints(
         logger.info(msg)
 
     elites = elites[:elite_n] if elites else []
-    # diversity metrics among elites
     elite_seqs = [e["seq"] for e in elites]
     elite_db = [e.get("dot_bracket", None) for e in elites]
 
@@ -336,13 +300,12 @@ def select_elites_with_constraints(
 class EvalConfig:
     omp_threads: int = 1
     simrna_iterations: int = 200000
-    simrna_frames: str = "1"          # "1-5"
-    decoy_agg: str = "min"            # min/mean/boltz/p10
+    simrna_frames: str = "1"
+    decoy_agg: str = "min"
     vina_exhaustiveness: int = 8
     vina_padding: float = 8.0
     vina_cpu: int = 1
 
-    # ligand ensemble
     ligand_conformers: int = 0
     ligand_seed: int = 123
     ligand_prune_rmsd: float = 0.5
@@ -351,44 +314,25 @@ class EvalConfig:
     ligand_max_opt_iters: int = 200
 
 
-
-
-
 @dataclass
 class MDConfig:
-    # Post-run MD refinement for top-X sequences (GROMACS).
     enabled: bool = False
     topX: int = 5
-
-    # Path to gromacs executable (e.g., "gmx" or "gmx_mpi")
     gmx: str = "gmx"
-
-    # Where .mdp files live; files: em.mdp, ions.mdp, nvt.mdp, npt.mdp, md.mdp
     mdp_dir: str = "mdp"
-
-    # Forcefield/water model for pdb2gmx (RNA aptamer).
-    # Example: "amber14sb" or "charmm36-jul2022"; depends on your GROMACS installation.
     forcefield: str = "amber14sb"
     water: str = "tip3p"
-
-    # RNA PDB hygiene: some generators include a 5' phosphate (P/OP1/OP2/...) but
-    # some termini templates expect a 5' hydroxyl. When True, we strip phosphate atoms
-    # from the first residue before pdb2gmx.
     strip_5prime_phosphate: bool = True
     strip_3prime_phosphate: bool = False
-
-    # Box / solvation / ions
     box_type: str = "cubic"
-    box_distance_nm: float = 1.0   # distance to box edge
-    salt_conc_m: float = 0.15      # NaCl (mol/L)
+    box_distance_nm: float = 1.0
+    salt_conc_m: float = 0.15
     neutralize: bool = True
-
-    # Run controls
-    threads: int = 0              # 0 => let gromacs decide
-    gpu: bool = False             # if True, append '-nb gpu' where applicable
-
-    # If True, skip MD for a target if its final md output already exists
+    threads: int = 0
+    gpu: bool = False
     skip_if_done: bool = True
+
+
 class DiskCache:
     """Simple JSONL cache; key is seq."""
     def __init__(self, path: Path):
@@ -442,18 +386,18 @@ def default_cfg() -> dict:
             "topN": 20,
         },
         "regularize": {
-            "entropy_uniform_mix": 0.0,      # 0~0.1
-            "elite_min_hamming": 0.0,        # normalized distance
+            "entropy_uniform_mix": 0.0,
+            "elite_min_hamming": 0.0,
             "struct_unique": False,
-            "struct_metric": "bp",           # bp/edit
-            "struct_min_dist": 0.0,          # 0~1
+            "struct_metric": "bp",
+            "struct_min_dist": 0.0,
         },
         "monitor": {
             "penalty_skip": {
                 "enabled": True,
-                "frac_thr": 0.95,            # penalty_frac >= thr => skip update
-                "action": "skip",            # skip/reset_uniform
-                "reset_patience": 2,         # if reset_uniform, streak >= this => reset
+                "frac_thr": 0.95,
+                "action": "skip",
+                "reset_patience": 2,
             },
             "early_stop": {
                 "enabled": False,
@@ -481,8 +425,6 @@ def default_cfg() -> dict:
             "vina_exhaustiveness": 8,
             "vina_cpu": 1,
             "grid_padding": 8.0,
-
-            # ligand conformer ensemble
             "ligand_conformers": 0,
             "ligand_seed": 123,
             "ligand_prune_rmsd": 0.5,
@@ -505,7 +447,6 @@ def default_cfg() -> dict:
             "gpu": False,
             "skip_if_done": True,
         },
-
     }
 
 
@@ -521,9 +462,6 @@ def dock_one_compat(
     exhaustiveness: int,
     cpu: int,
 ):
-    """
-    dock_one in some versions may not accept cpu=. Try cpu first, fall back without.
-    """
     try:
         return dock_one(
             name=name,
@@ -546,7 +484,7 @@ def dock_one_compat(
 
 
 # -----------------------------
-# Ligand ensemble preparation (RDKit conformers, cached)
+# Ligand ensemble preparation (with charge preservation)
 # -----------------------------
 def prepare_ligand_ensemble_if_needed(
     ligand_file: Path,
@@ -557,12 +495,37 @@ def prepare_ligand_ensemble_if_needed(
     """
     Returns (ligand_sdfs, manifest_path)
     If ligand_conformers==0 => [ligand_file], None
+    If ligand_ensemble already exists with charge info, SKIP regeneration
+    to preserve user-specified charge settings.
     """
     n = int(getattr(eval_cfg, "ligand_conformers", 0) or 0)
     if n <= 0:
         return [ligand_file], None
 
     out_dir = (run_dir / "ligand_ensemble").resolve()
+    manifest_file = out_dir / "manifest.json"
+    charge_file = out_dir / "charge.txt"
+
+    # If user already prepared ligand ensemble (e.g. with --charge -1), reuse it
+    if manifest_file.exists() and charge_file.exists():
+        try:
+            manifest_data = json.loads(manifest_file.read_text())
+            items = manifest_data.get("items", [])
+            existing_files = [Path(item["path"]) for item in items]
+            if existing_files and all(p.exists() for p in existing_files):
+                charge_info = manifest_data.get("charge_info", {})
+                charge_val = charge_info.get("formal_charge", "N/A")
+                charge_method = charge_info.get("detection_method", "N/A")
+                logger.info(
+                    f"Ligand ensemble already exists: {len(existing_files)} conformers, "
+                    f"charge={charge_val} (method={charge_method}). "
+                    f"Reusing existing ensemble (will NOT overwrite)."
+                )
+                return existing_files, manifest_file
+        except Exception as e:
+            logger.warning(f"Existing ligand ensemble corrupted, regenerating: {e}")
+
+    # No pre-existing ensemble found, generate new one
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = LigandConformerConfig(
@@ -583,10 +546,6 @@ def prepare_ligand_ensemble_if_needed(
 # Score aggregation across frames
 # -----------------------------
 def aggregate_scores(scores: List[float], method: str = "min", boltz_beta: float = 1.0) -> Dict[str, float]:
-    """
-    Lower score is better (vina affinity, usually negative).
-    Provide multiple summaries plus the final 'score' used for CE.
-    """
     if not scores:
         return {
             "score": 1e9,
@@ -600,7 +559,6 @@ def aggregate_scores(scores: List[float], method: str = "min", boltz_beta: float
     smean = float(np.mean(arr))
     sp10 = float(np.quantile(arr, 0.10))
 
-    # soft-min (Boltzmann): weights = exp(-beta*(s - smin))
     x = arr - smin
     w = np.exp(-float(boltz_beta) * x)
     w = w / (np.sum(w) + 1e-12)
@@ -638,7 +596,6 @@ def evaluate_sequence(
     tag = sha1(seq)
     fold_dir = work_root / "fold" / tag
 
-    # 1) ViennaRNA + SimRNA multi-frames
     res2d, res3d = fold_sequence_to_pdb_with_vienna(
         seq=seq,
         workdir=fold_dir,
@@ -652,7 +609,6 @@ def evaluate_sequence(
     dotb = getattr(res2d, "dotbracket", None)
     pdbs = [Path(p) for p in getattr(res3d, "all_atom_pdbs", [])]
     if not pdbs:
-        # fall back to single
         p0 = getattr(res3d, "all_atom_pdb", None)
         if p0:
             pdbs = [Path(p0)]
@@ -663,7 +619,6 @@ def evaluate_sequence(
     frame_scores: List[float] = []
     frame_best: List[Dict] = []
 
-    # 2) Dock each frame; for each frame choose best ligand conformer
     for fi, receptor_pdb in enumerate(pdbs, start=1):
         best_sc = 1e9
         best_item: Optional[Dict] = None
@@ -830,18 +785,15 @@ def export_rescore_topM(
             break
         if (not include_penalty) and is_penalty(rec):
             continue
-        # must have these to be useful
         if not rec.get("best_receptor_pdb") or not rec.get("best_dock_pose_pdbqt"):
             continue
         picked.append(rec)
 
-    # write artifacts
     with manifest.open("w") as f:
         for k, rec in enumerate(picked, start=1):
             item_dir = out_dir / f"rank_{k:03d}_{rec.get('eval_hash','')}"
             item_dir.mkdir(parents=True, exist_ok=True)
 
-            # copy pose/log/receptor
             src_receptor = Path(rec["best_receptor_pdb"])
             src_pose = Path(rec["best_dock_pose_pdbqt"])
             src_log = Path(rec.get("best_dock_log", "")) if rec.get("best_dock_log") else None
@@ -896,7 +848,6 @@ def safe_update_meta_end(meta_path: Path, run_dir: Path, status: str, best: Opti
         sig = None
 
     if sig is None:
-        # fallback: try positional
         try:
             update_meta_end(meta_path, status=status, best=best)
             return
@@ -911,25 +862,18 @@ def safe_update_meta_end(meta_path: Path, run_dir: Path, status: str, best: Opti
     if "run_dir" in params:
         update_meta_end(run_dir=run_dir, status=status, best=best)
         return
-    # last resort positional
     try:
         update_meta_end(meta_path, status=status, best=best)
     except Exception:
         update_meta_end(run_dir, status=status, best=best)
 
 
-
 # -----------------------------
 # Post-run MD refinement (GROMACS) for top-X sequences
 # -----------------------------
-
-# ---- GROMACS CLI capability detection (for conda/packaging differences)
 _GMX_HELP_CACHE = {}
 
 def _gmx_supports(gmx: str, subcmd: str, flag: str) -> bool:
-    """Return True if `gmx <subcmd> -h` contains the given flag (e.g. '-v').
-    Cached per (gmx, subcmd). Never raises; returns False on errors.
-    """
     key = (gmx, subcmd)
     if key not in _GMX_HELP_CACHE:
         try:
@@ -942,20 +886,16 @@ def _gmx_supports(gmx: str, subcmd: str, flag: str) -> bool:
 
 
 def _entry_score(rec: Dict) -> float:
-    """Return the scalar used to rank candidates globally (lower is better)."""
-    # Prefer explicit aggregated score if present; fallback to docking score.
     for k in ("score", "agg_score", "dock_score", "vina_score", "best_score"):
         if k in rec and rec[k] is not None:
             try:
                 return float(rec[k])
             except Exception:
                 pass
-    # As a last resort, push to the bottom.
     return float("inf")
 
 
 def _run_cmd(cmd: List[str], cwd: Path, logger, input_text: Optional[str] = None) -> None:
-    """Run a command, raise RuntimeError on failure, log stdout/stderr."""
     cwd.mkdir(parents=True, exist_ok=True)
     logger.info(f"[md] $ (cd {cwd}) {' '.join(cmd)}")
     try:
@@ -977,42 +917,19 @@ def _run_cmd(cmd: List[str], cwd: Path, logger, input_text: Optional[str] = None
 
 
 def _mdrun_cmd(gmx: str, deffnm: str, threads: int, gpu: bool) -> List[str]:
-    """Build a robust `gmx mdrun` command.
-
-    Goals:
-      - Avoid GROMACS GPU rank/thread ambiguity errors (set both -ntmpi and -ntomp).
-      - Prefer deterministic CPU pinning for better performance.
-      - Ensure progress/ETA shows up in logs (use -v and -v).
-      - Reduce I/O overhead (-noconfout) since we only need final coordinates for this workflow.
-    """
     cmd: List[str] = [gmx, "mdrun", "-deffnm", deffnm]
-
-    # Thread-MPI (not OpenMPI) is used by conda-forge builds unless you installed an MPI variant.
-    # With GPU offload, ALWAYS specify -ntmpi to avoid "conflicting demands" errors.
     ntmpi = 1
     cmd += ["-ntmpi", str(ntmpi)]
-    # Only force -ntomp when the caller explicitly requests >1 thread.
-    # If threads<=1, let GROMACS auto-pick (often better, and avoids accidental serialization).
     if int(threads) > 1:
         cmd += ["-ntomp", str(int(threads))]
-    # Make progress visible (frequent log updates with -v; ETA shows near the end of the run).
     cmd += ["-v"]
-
-    # Pin threads for better performance/consistency.
     cmd += ["-pin", "on"]
-
     if gpu:
         cmd += ["-nb", "gpu"]
-
     return cmd
 
 
 def _run_md_analysis(gmx: str, workdir: str, logger: logging.Logger) -> None:
-    """
-    Run post-MD analysis (RMSD/RMSF) with auto-recovery.
-    Only compute missing outputs.
-    """
-
     workdir = Path(workdir)
     tpr = workdir / "md.tpr"
     xtc = workdir / "md.xtc"
@@ -1023,7 +940,6 @@ def _run_md_analysis(gmx: str, workdir: str, logger: logging.Logger) -> None:
         logger.warning("[md] md.tpr or md.xtc missing, skip analysis")
         return
 
-    # ---------- RMSD ----------
     if not rmsd_xvg.exists():
         try:
             logger.info("[md] RMSD: calculating (RNA group index=1)")
@@ -1034,7 +950,6 @@ def _run_md_analysis(gmx: str, workdir: str, logger: logging.Logger) -> None:
     else:
         logger.info("[md] RMSD: exists, skip")
 
-    # ---------- RMSF ----------
     if not rmsf_xvg.exists():
         try:
             logger.info("[md] RMSF: calculating (RNA group index=1)")
@@ -1045,6 +960,7 @@ def _run_md_analysis(gmx: str, workdir: str, logger: logging.Logger) -> None:
     else:
         logger.info("[md] RMSF: exists, skip")
 
+
 def _sanitize_rna_pdb(
     in_pdb: Path,
     out_pdb: Path,
@@ -1052,17 +968,7 @@ def _sanitize_rna_pdb(
     strip_5prime_phosphate: bool = True,
     strip_3prime_phosphate: bool = False,
 ) -> None:
-    """Sanitize an RNA PDB so `gmx pdb2gmx` can build a topology reliably.
-
-    Many RNA structure generators output a 5' phosphate group. Depending on the forcefield's
-    termini templates, pdb2gmx may interpret the first residue as a 5' hydroxyl terminus
-    (e.g. RU5/RA5) and then fail if phosphate atoms are present.
-
-    Practical fix: optionally strip phosphate atoms (P/OP*/O*P) from the first and/or last
-    residue (by file order). This preserves sugar/base atoms and keeps the rest unchanged.
-    """
     phosphate_atoms = {"P", "OP1", "OP2", "OP3", "O1P", "O2P", "O3P"}
-
     lines = in_pdb.read_text().splitlines(True)
 
     residues: list[tuple[str, str, str]] = []
@@ -1117,16 +1023,13 @@ def run_md_one_target(
     gpu: bool,
     logger,
 ) -> None:
-    """Run an aptamer-only GROMACS workflow in workdir."""
     workdir.mkdir(parents=True, exist_ok=True)
-    # Copy mdp files for provenance
     for fn in ("em.mdp", "ions.mdp", "nvt.mdp", "npt.mdp", "md.mdp"):
         src = mdp_dir / fn
         if not src.exists():
             raise RuntimeError(f"Missing MDP: {src}")
         shutil.copy2(src, workdir / fn)
 
-    # Preprocess RNA PDB for pdb2gmx compatibility (termini phosphate mismatch is common).
     sanitized_pdb = workdir / "input_sanitized.pdb"
     _sanitize_rna_pdb(
         input_pdb,
@@ -1136,35 +1039,22 @@ def run_md_one_target(
     )
     input_pdb = sanitized_pdb
 
-    # 1) pdb2gmx
-    # NOTE: pdb2gmx may prompt for termini; for nucleic acids it is usually non-interactive,
-    # but if your forcefield prompts, you'll need to run interactively once to learn the choices.
     _run_cmd(
         [gmx, "pdb2gmx", "-f", str(input_pdb), "-o", "processed.gro", "-p", "topol.top",
          "-ff", forcefield, "-water", water, "-ignh"],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
-
-    # 2) define box
     _run_cmd(
         [gmx, "editconf", "-f", "processed.gro", "-o", "boxed.gro", "-c", "-d", str(box_distance_nm), "-bt", box_type],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
-
-    # 3) solvate
     _run_cmd(
         [gmx, "solvate", "-cp", "boxed.gro", "-cs", "spc216.gro", "-o", "solv.gro", "-p", "topol.top"],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
-
-    # 4) ions (grompp + genion)
     _run_cmd(
         [gmx, "grompp", "-f", "ions.mdp", "-c", "solv.gro", "-p", "topol.top", "-o", "ions.tpr", "-maxwarn", "2"],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
     genion_cmd = [gmx, "genion", "-s", "ions.tpr", "-o", "solv_ions.gro", "-p", "topol.top"]
     if neutralize:
@@ -1172,45 +1062,35 @@ def run_md_one_target(
     if salt_conc_m and float(salt_conc_m) > 0:
         genion_cmd += ["-conc", str(float(salt_conc_m))]
     genion_cmd += ["-pname", "NA", "-nname", "CL"]
-    # select SOL group (commonly index 13); safest is by name. Most builds accept text "SOL".
     _run_cmd(genion_cmd, cwd=workdir, logger=logger, input_text="SOL\n")
 
-    # 5) EM
     _run_cmd(
         [gmx, "grompp", "-f", "em.mdp", "-c", "solv_ions.gro", "-p", "topol.top", "-o", "em.tpr", "-maxwarn", "2"],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
     _run_cmd(_mdrun_cmd(gmx, "em", threads, gpu), cwd=workdir, logger=logger)
 
-    # 6) NVT
     _run_cmd(
         [gmx, "grompp", "-f", "nvt.mdp", "-c", "em.gro", "-r", "em.gro", "-p", "topol.top", "-o", "nvt.tpr", "-maxwarn", "2"],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
     _run_cmd(_mdrun_cmd(gmx, "nvt", threads, gpu), cwd=workdir, logger=logger)
 
-    # 7) NPT
     _run_cmd(
         [gmx, "grompp", "-f", "npt.mdp", "-c", "nvt.gro", "-r", "nvt.gro", "-t", "nvt.cpt", "-p", "topol.top", "-o", "npt.tpr", "-maxwarn", "2"],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
     _run_cmd(_mdrun_cmd(gmx, "npt", threads, gpu), cwd=workdir, logger=logger)
 
-    # 8) Production MD
     _run_cmd(
         [gmx, "grompp", "-f", "md.mdp", "-c", "npt.gro", "-t", "npt.cpt", "-p", "topol.top", "-o", "md.tpr", "-maxwarn", "2"],
-        cwd=workdir,
-        logger=logger,
+        cwd=workdir, logger=logger,
     )
     _run_cmd(_mdrun_cmd(gmx, "md", threads, gpu), cwd=workdir, logger=logger)
     _run_md_analysis(gmx=gmx, workdir=workdir, logger=logger)
 
 
 def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig, logger) -> None:
-    """Select global top-X from cache and run aptamer-only MD for each."""
     if not md_cfg.enabled:
         logger.info("[md] md.enabled=false; skip")
         return
@@ -1222,7 +1102,6 @@ def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig,
     if not mdp_dir.exists():
         raise RuntimeError(f"mdp_dir not found: {mdp_dir}")
 
-    # Rank globally by score (lower is better)
     items = list(cache.map.items())
     items.sort(key=lambda kv: _entry_score(kv[1]))
     top_items = items[: int(md_cfg.topX)]
@@ -1237,12 +1116,10 @@ def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig,
         status = "ok"
         err = ""
 
-        # Locate structure to simulate
         pdb_path = None
         for k in ("best_receptor_pdb", "receptor_pdb", "pdb", "best_pdb"):
             if k in rec and rec[k]:
                 p = Path(str(rec[k])).expanduser()
-                # Many cached paths are absolute; keep as-is. If relative, anchor at run_dir.
                 if not p.is_absolute():
                     p = (run_dir / p).resolve()
                 if p.exists():
@@ -1252,7 +1129,6 @@ def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig,
             status = "skip"
             err = "no_pdb_in_cache"
         else:
-            # Skip if done
             xtc_file = workdir / "md.xtc"
             gro_file = workdir / "md.gro"
 
@@ -1291,7 +1167,6 @@ def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig,
                     err = str(e).splitlines()[0][:240]
                     logger.error(f"[md] rank={rank:03d} FAILED: {e}")
 
-
                     summary_rows.append({
                         "rank": rank,
                         "seq": seq,
@@ -1308,9 +1183,8 @@ def run_md_postprocess_topX(run_dir: Path, cache: "DiskCache", md_cfg: MDConfig,
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default=None)
-    # Override target iteration count (useful for per-iteration CE↔GBSA feedback loops).
     p.add_argument("--iters", type=int, default=None)
-    p.add_argument("--md_only", action="store_true", help="Only run MD postprocess on global top-X and exit (requires md.enabled: true).")
+    p.add_argument("--md_only", action="store_true", help="Only run MD postprocess on global top-X and exit.")
     p.add_argument("--set", action="append", default=[])
     args = p.parse_args()
 
@@ -1329,7 +1203,7 @@ def main() -> None:
     write_resolved_config(run_dir, cfg)
     logger = setup_logging(run_dir=run_dir, name="ce_design", level=str(cfg["run"].get("log_level", "INFO")))
 
-    # --- md-only mode: run postprocess for an already-completed run_dir and exit ---
+    # --- md-only mode ---
     if args.md_only:
         md_block = cfg.get("md", {})
         md_cfg = MDConfig(
@@ -1349,7 +1223,7 @@ def main() -> None:
         )
 
         if not md_cfg.enabled:
-            raise SystemExit("md_only set but md.enabled is false. Enable md in your YAML (md.enabled: true).")
+            raise SystemExit("md_only set but md.enabled is false.")
 
         cache_path = run_dir / "cache.jsonl"
         if not cache_path.exists():
@@ -1374,7 +1248,6 @@ def main() -> None:
         global_seed = int(cfg["run"].get("seed", 123))
         resume = bool(cfg["run"].get("resume", True))
 
-        # eval config
         eval_cfg = EvalConfig(
             omp_threads=int(cfg["eval"].get("omp_threads", 1)),
             simrna_iterations=int(cfg["eval"]["simrna_iterations"]),
@@ -1383,7 +1256,6 @@ def main() -> None:
             vina_exhaustiveness=int(cfg["eval"]["vina_exhaustiveness"]),
             vina_padding=float(cfg["eval"]["grid_padding"]),
             vina_cpu=int(cfg["eval"].get("vina_cpu", 1)),
-
             ligand_conformers=int(cfg["eval"].get("ligand_conformers", 0)),
             ligand_seed=int(cfg["eval"].get("ligand_seed", 123)),
             ligand_prune_rmsd=float(cfg["eval"].get("ligand_prune_rmsd", 0.5)),
@@ -1392,15 +1264,13 @@ def main() -> None:
             ligand_max_opt_iters=int(cfg["eval"].get("ligand_max_opt_iters", 200)),
         )
 
-        # parallel safety
         if workers > 1 and eval_cfg.omp_threads != 1:
             logger.info("workers>1: force eval.omp_threads=1 to avoid oversubscription")
             eval_cfg.omp_threads = 1
 
-        # ligand ensemble (pre-generate once, reuse)
+        # Ligand ensemble: reuse existing if present (preserves user-set charge)
         ligand_sdfs, ligand_manifest = prepare_ligand_ensemble_if_needed(ligand_file, run_dir, eval_cfg, logger)
 
-        # CE config
         ce_cfg = CEConfig(
             length=int(cfg["ce"]["length"]),
             alphabet=str(cfg["ce"].get("alphabet", "RNA")),
@@ -1418,7 +1288,6 @@ def main() -> None:
         top_csv = run_dir / "topN.csv"
         checkpoint = run_dir / "checkpoint.json"
 
-        # resume / init
         if (not resume) and dist_path.exists():
             dist_path.unlink(missing_ok=True)
         if (not resume) and cache_path.exists():
@@ -1440,7 +1309,6 @@ def main() -> None:
 
         rng = np.random.default_rng(int(ce_cfg.seed))
 
-        # global best from cache
         global_best: Optional[Dict] = None
         for rec in cache.map.values():
             try:
@@ -1471,9 +1339,7 @@ def main() -> None:
 
         iters = int(cfg["ce"]["iters"])
         topN_keep = int(cfg["ce"].get("topN", 20))
-        # -----------------------------
-        # Resume semantics for iteration counter + monitor state
-        # -----------------------------
+
         ck: Dict = {}
         start_iter = 1
         if resume and checkpoint.exists():
@@ -1484,7 +1350,6 @@ def main() -> None:
                 ck = {}
                 start_iter = 1
 
-        # Avoid duplicate history rows when re-running with resume.
         if start_iter > 1 and history:
             try:
                 history = [r for r in history if int(r.get("iter", 0)) < start_iter]
@@ -1499,8 +1364,6 @@ def main() -> None:
             safe_update_meta_end(Path(meta_path), run_dir, status="done", best=global_best)
             return
 
-
-        # monitors / regularizers
         reg = cfg.get("regularize", {})
         entropy_mix = float(reg.get("entropy_uniform_mix", 0.0))
         elite_min_ham = float(reg.get("elite_min_hamming", 0.0))
@@ -1509,27 +1372,24 @@ def main() -> None:
         struct_min_dist = float(reg.get("struct_min_dist", 0.0))
 
         mon = cfg.get("monitor", {})
-        # penalty skip
         pen_cfg = mon.get("penalty_skip", {})
         pen_enabled = bool(pen_cfg.get("enabled", True))
         pen_thr = float(pen_cfg.get("frac_thr", 0.95))
         pen_action = str(pen_cfg.get("action", "skip")).lower()
         pen_reset_pat = int(pen_cfg.get("reset_patience", 2))
 
-        # early stop
         es_cfg = mon.get("early_stop", {})
         es_enabled = bool(es_cfg.get("enabled", False))
         es_pat = int(es_cfg.get("patience", 6))
         es_min_improve = float(es_cfg.get("min_improve", 0.05))
 
-        # collapse
         col_cfg = mon.get("collapse", {})
         col_enabled = bool(col_cfg.get("enabled", False))
         col_max_prob = float(col_cfg.get("max_prob", 0.95))
         col_frac_thr = float(col_cfg.get("frac_thr", 0.60))
         col_pat = int(col_cfg.get("patience", 4))
 
-       # -------- rescore configuration (ratio-based only) --------
+        # -------- rescore configuration --------
         rs_cfg = cfg.get("rescore", {})
         rs_enabled = bool(rs_cfg.get("enabled", False))
         rs_include_penalty = bool(rs_cfg.get("include_penalty", False))
@@ -1548,7 +1408,6 @@ def main() -> None:
             f"computed topM={rs_topM}"
         )
 
-        # md postprocess hook (top-X MD after all iterations)
         md_block = cfg.get("md", {})
         md_cfg = MDConfig(
             enabled=bool(md_block.get("enabled", False)),
@@ -1566,8 +1425,6 @@ def main() -> None:
             skip_if_done=bool(md_block.get("skip_if_done", True)),
         )
 
-
-        # Restore monitor state from checkpoint so resume does not reset streaks
         early_streak = int(ck.get("early_streak", 0)) if isinstance(ck, dict) else 0
         collapse_streak = int(ck.get("collapse_streak", 0)) if isinstance(ck, dict) else 0
         penalty_streak = int(ck.get("penalty_streak", 0)) if isinstance(ck, dict) else 0
@@ -1583,10 +1440,8 @@ def main() -> None:
         stop_reason = str(ck.get("stop_reason", "")) if isinstance(ck, dict) else ""
 
         for iter_idx in range(start_iter, iters + 1):
-            # sample batch
             seqs = dist.sample(int(ce_cfg.batch_size), rng)
 
-            # unique
             seen = set()
             uniq = []
             for s in seqs:
@@ -1594,7 +1449,6 @@ def main() -> None:
                     seen.add(s)
                     uniq.append(s)
 
-            # cache split
             records: List[Dict] = []
             todo: List[str] = []
             for s in uniq:
@@ -1606,7 +1460,6 @@ def main() -> None:
 
             logger.info(f"[iter {iter_idx}] batch={len(uniq)} cached={len(records)} todo={len(todo)} workers={workers}")
 
-            # evaluate todo first (important)
             if todo:
                 new_recs = evaluate_batch_parallel(
                     seqs=todo,
@@ -1622,7 +1475,6 @@ def main() -> None:
                     cache.put(r)
                 records.extend(new_recs)
 
-            # rank
             records.sort(key=lambda x: float(x["score"]))
             mean_score = float(np.mean([float(r["score"]) for r in records])) if records else 1e9
             best = records[0] if records else {"seq": "", "score": 1e9}
@@ -1630,16 +1482,12 @@ def main() -> None:
             if global_best is None or float(best["score"]) < float(global_best["score"]):
                 global_best = best
 
-            # penalty fraction
             penalty_frac = float(np.mean([1.0 if is_penalty(r) else 0.0 for r in records])) if records else 1.0
 
-            # distribution diagnostics (pre-update)
             ds = dist_stats(dist)
 
-            # elite size
             elite_n = max(1, int(math.ceil(float(ce_cfg.elite_frac) * len(records)))) if records else 1
 
-            # elite selection with fallback logging
             elites, elite_metrics, stage_log = select_elites_with_constraints(
                 sorted_records=records,
                 elite_n=elite_n,
@@ -1651,7 +1499,6 @@ def main() -> None:
             )
             elite_seqs = [e["seq"] for e in elites]
 
-            # -------- 3) penalty-only round protection --------
             did_update = True
             if pen_enabled and penalty_frac >= pen_thr:
                 penalty_streak += 1
@@ -1659,32 +1506,25 @@ def main() -> None:
                 logger.info(f"[iter {iter_idx}] penalty_frac={penalty_frac:.3f} >= {pen_thr:.3f} -> SKIP CE UPDATE (streak={penalty_streak})")
 
                 if pen_action == "reset_uniform" and penalty_streak >= pen_reset_pat:
-                    # reset to uniform distribution to avoid learning noise
                     P = get_probs(dist)
                     L, K = P.shape
                     U = np.ones((L, K), dtype=float) / float(K)
                     set_probs(dist, U)
                     logger.info(f"[iter {iter_idx}] penalty_streak >= {pen_reset_pat} -> RESET distribution to uniform")
-                    # keep streak (or reset)
                     penalty_streak = 0
             else:
                 penalty_streak = 0
 
-            # update distribution only if allowed
             if did_update:
                 dist.update_from_elites(elite_seqs)
-                # -------- 5) explicit entropy regularization (uniform mix) --------
                 if entropy_mix > 0:
                     apply_uniform_mix_entropy_regularization(dist, mix=entropy_mix)
 
-            # save dist always (so resume works)
             dist.save(dist_path)
 
-            # collapse monitoring (post-update stats)
             ds2 = dist_stats(dist)
             maxp_frac095 = float(ds2["dist_maxp_frac095"])
             if col_enabled:
-                # use stricter threshold than 0.95 if configured
                 Pnow = get_probs(dist)
                 maxp_i = np.max(Pnow, axis=1)
                 frac = float(np.mean(maxp_i >= col_max_prob))
@@ -1695,10 +1535,9 @@ def main() -> None:
             else:
                 collapse_streak = 0
 
-            # early stop monitoring
             if es_enabled and global_best is not None:
                 best_now = float(global_best["score"])
-                improve = float(best_prev - best_now)  # positive => improved (lower is better)
+                improve = float(best_prev - best_now)
                 if improve < es_min_improve:
                     early_streak += 1
                 else:
@@ -1713,7 +1552,6 @@ def main() -> None:
             if col_enabled and collapse_streak >= col_pat:
                 stop_reason = f"collapse(patience={col_pat}, frac_thr={col_frac_thr}, max_prob={col_max_prob})"
 
-            # history row
             history.append(
                 {
                     "iter": str(iter_idx),
@@ -1738,12 +1576,10 @@ def main() -> None:
             )
             write_csv(history_csv, history, history_fields)
 
-            # topN.csv from cache
             all_recs = list(cache.map.values())
             all_recs.sort(key=lambda x: float(x["score"]))
             write_csv(top_csv, all_recs[:topN_keep], top_fields)
 
-            # -------- 5) Top-M rescore export hook --------
             if rs_enabled:
                 export_rescore_topM(
                     run_dir=run_dir,
@@ -1754,7 +1590,6 @@ def main() -> None:
                     logger=logger,
                 )
 
-            # checkpoint (must be written every iter, regardless of rs_enabled)
             checkpoint.write_text(
                 json.dumps(
                     {
@@ -1785,7 +1620,6 @@ def main() -> None:
 
         logger.info("DONE")
 
-        # -------- Post-run MD refinement (optional) --------
         if getattr(md_cfg, "enabled", False):
             try:
                 logger.info(f"[md] enabled: running MD for global top-{int(md_cfg.topX)} sequences")
