@@ -469,7 +469,8 @@ def default_cfg() -> dict:
         },
         "rescore": {
             "enabled": False,
-            "topM": 10,
+            "top_frac": None,
+            "elite_frac": None,
             "include_penalty": False,
         },
         "eval": {
@@ -1528,11 +1529,24 @@ def main() -> None:
         col_frac_thr = float(col_cfg.get("frac_thr", 0.60))
         col_pat = int(col_cfg.get("patience", 4))
 
-        # rescore hook
+       # -------- rescore configuration (ratio-based only) --------
         rs_cfg = cfg.get("rescore", {})
         rs_enabled = bool(rs_cfg.get("enabled", False))
-        rs_topM = int(rs_cfg.get("topM", 10))
         rs_include_penalty = bool(rs_cfg.get("include_penalty", False))
+
+        batch_size = int(cfg["ce"]["batch"])
+
+        top_frac = rs_cfg.get("top_frac", None)
+        if top_frac is None:
+            raise ValueError("rescore.top_frac must be defined in YAML (ratio-based rescoring is required).")
+
+        rs_topM = max(1, int(math.ceil(batch_size * float(top_frac))))
+
+        logger.info(
+            f"[rescore] enabled={rs_enabled}, "
+            f"top_frac={top_frac}, batch={batch_size}, "
+            f"computed topM={rs_topM}"
+        )
 
         # md postprocess hook (top-X MD after all iterations)
         md_block = cfg.get("md", {})
