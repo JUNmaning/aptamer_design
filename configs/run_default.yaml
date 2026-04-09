@@ -69,6 +69,7 @@ rescore:
   top_frac: 0.1
   elite_frac: 0.5
   include_penalty: false
+  gbsa_workers: 30
 
 md:
   enabled: false
