@@ -406,14 +406,20 @@ while true; do
     finalize_iter_if_needed "$cur"
   fi
 
-  # 2) dual plateau stop check
+  # 2) dual plateau stop check (AND: require BOTH GBSA and Docking plateau)
   if [[ -z "$reason" && "$cur" -ge 1 ]]; then
-    if [[ "$(gbsa_stop_triggered)" == "1" ]]; then
-      reason="$(set_external_stop_reason "gbsa_plateau(patience=${GBSA_PATIENCE}, min_improve=${GBSA_MIN_IMPROVE})")"
-      log "External stop triggered: $reason"
-    elif [[ "$(dock_stop_triggered)" == "1" ]]; then
-      reason="$(set_external_stop_reason "dock_plateau(patience=${DOCK_PATIENCE}, min_improve=${DOCK_MIN_IMPROVE})")"
-      log "External stop triggered: $reason"
+    gbsa_flag="$(gbsa_stop_triggered)"
+    dock_flag="$(dock_stop_triggered)"
+
+    if [[ "$gbsa_flag" == "1" && "$dock_flag" == "1" ]]; then
+      reason="$(set_external_stop_reason "both_plateau(gbsa_patience=${GBSA_PATIENCE}, gbsa_min_improve=${GBSA_MIN_IMPROVE}; dock_patience=${DOCK_PATIENCE}, dock_min_improve=${DOCK_MIN_IMPROVE})")"
+      log "External stop triggered: BOTH GBSA and Docking reached plateau."
+    else
+      if [[ "$gbsa_flag" == "1" && "$dock_flag" != "1" ]]; then
+        log "Notice: GBSA hit plateau, waiting for Docking to plateau..."
+      elif [[ "$dock_flag" == "1" && "$gbsa_flag" != "1" ]]; then
+        log "Notice: Docking hit plateau, waiting for GBSA to plateau..."
+      fi
     fi
   fi
 
