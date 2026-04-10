@@ -32,6 +32,11 @@ print(cur if cur is not None else "")
 PY
 }
 
+is_true() {
+  local v="${1:-}"
+  [[ "$v" == "1" || "$v" == "true" || "$v" == "True" || "$v" == "TRUE" || "$v" == "yes" || "$v" == "Yes" || "$v" == "YES" ]]
+}
+
 RUN_DIR="$(yaml_get run.run_dir)"
 [[ -n "${RUN_DIR}" ]] || die "Cannot read run.run_dir from $CFG (is the YAML key correct?)"
 RUN_DIR="$(python - <<PY
@@ -57,9 +62,20 @@ TOP_FRAC="$(yaml_get rescore.top_frac)"; TOP_FRAC="${TOP_FRAC:-}"
 ELITE_N_RAW="$(yaml_get rescore.elite_n)"; ELITE_N_RAW="${ELITE_N_RAW:-5}"
 ELITE_FRAC="$(yaml_get rescore.elite_frac)"; ELITE_FRAC="${ELITE_FRAC:-}"
 
-# GBSA configuration from YAML
+# MMGBSA configuration from YAML
 GBSA_WORKERS="$(yaml_get rescore.gbsa_workers)"; GBSA_WORKERS="${GBSA_WORKERS:-1}"
 GBSA_CHARGE_METHOD="$(yaml_get rescore.gbsa_charge_method)"; GBSA_CHARGE_METHOD="${GBSA_CHARGE_METHOD:-bcc}"
+
+# --- NEW: minimization knobs (optional YAML keys; default enabled) ---
+MMGBSA_IGB="$(yaml_get rescore.mmgbsa_igb)"; MMGBSA_IGB="${MMGBSA_IGB:-5}"
+MMGBSA_SALTCON="$(yaml_get rescore.mmgbsa_saltcon)"; MMGBSA_SALTCON="${MMGBSA_SALTCON:-0.150}"
+
+MMGBSA_MINIMIZE="$(yaml_get rescore.mmgbsa_minimize)"; MMGBSA_MINIMIZE="${MMGBSA_MINIMIZE:-true}"
+MMGBSA_MIN_RESTRAINT="$(yaml_get rescore.mmgbsa_min_restraint)"; MMGBSA_MIN_RESTRAINT="${MMGBSA_MIN_RESTRAINT:-true}"
+MMGBSA_MIN_MAXCYC="$(yaml_get rescore.mmgbsa_min_maxcyc)"; MMGBSA_MIN_MAXCYC="${MMGBSA_MIN_MAXCYC:-1500}"
+MMGBSA_MIN_NCYC="$(yaml_get rescore.mmgbsa_min_ncyc)"; MMGBSA_MIN_NCYC="${MMGBSA_MIN_NCYC:-500}"
+MMGBSA_MIN_RESTRAINT_WT="$(yaml_get rescore.mmgbsa_min_restraint_wt)"; MMGBSA_MIN_RESTRAINT_WT="${MMGBSA_MIN_RESTRAINT_WT:-2.0}"
+MMGBSA_MIN_RESTRAINT_MASK="$(yaml_get rescore.mmgbsa_min_restraint_mask)"; MMGBSA_MIN_RESTRAINT_MASK="${MMGBSA_MIN_RESTRAINT_MASK:-!:LIG & !@H=}"
 
 # external dual-stop knobs (read from YAML monitor.external_stop.*)
 GBSA_PATIENCE="$(yaml_get monitor.external_stop.gbsa_patience)"; GBSA_PATIENCE="${GBSA_PATIENCE:-5}"
@@ -110,7 +126,8 @@ log "run_dir = $RUN_PATH"
 log "ce.iters=$MAX_ITERS, ce.batch=$BATCH"
 log "rescore selection: topM=$TOPM (top_frac=${TOP_FRAC:-<none>}, topM_raw=$TOPM_RAW)"
 log "feedback elite: elite_n=$ELITE_N (elite_frac=${ELITE_FRAC:-<none>}, elite_n_raw=$ELITE_N_RAW)"
-log "GBSA: workers=$GBSA_WORKERS, charge_method=$GBSA_CHARGE_METHOD"
+log "MMGBSA: workers=$GBSA_WORKERS, charge_method=$GBSA_CHARGE_METHOD, igb=$MMGBSA_IGB, saltcon=$MMGBSA_SALTCON"
+log "MMGBSA(min): minimize=$MMGBSA_MINIMIZE maxcyc=$MMGBSA_MIN_MAXCYC ncyc=$MMGBSA_MIN_NCYC restraint=$MMGBSA_MIN_RESTRAINT wt=$MMGBSA_MIN_RESTRAINT_WT mask='$MMGBSA_MIN_RESTRAINT_MASK'"
 log "GBSA stop: patience=$GBSA_PATIENCE min_improve=$GBSA_MIN_IMPROVE"
 log "Dock stop: patience=$DOCK_PATIENCE min_improve=$DOCK_MIN_IMPROVE"
 log "log capture: $LOGFILE"
@@ -155,7 +172,17 @@ run_ce_to_iter() {
 
 run_mmgbsa_for_iter() {
   local iter="$1"
-  log "MMGBSA: iter=$iter (topM=$TOPM, workers=$GBSA_WORKERS, charge_method=$GBSA_CHARGE_METHOD)"
+
+  local extra=()
+  if is_true "$MMGBSA_MINIMIZE"; then
+    extra+=(--minimize --min_maxcyc "$MMGBSA_MIN_MAXCYC" --min_ncyc "$MMGBSA_MIN_NCYC")
+    if is_true "$MMGBSA_MIN_RESTRAINT"; then
+      extra+=(--min_restraint --min_restraint_wt "$MMGBSA_MIN_RESTRAINT_WT" --min_restraint_mask "$MMGBSA_MIN_RESTRAINT_MASK")
+    fi
+  fi
+
+  log "MMGBSA: iter=$iter (topM=$TOPM, workers=$GBSA_WORKERS, charge_method=$GBSA_CHARGE_METHOD, igb=$MMGBSA_IGB, saltcon=$MMGBSA_SALTCON, minimize=$MMGBSA_MINIMIZE)"
+
   python -m experiments.rescore_mmgbsa \
     --run_dir "$RUN_PATH" \
     --iter "$iter" \
@@ -163,6 +190,9 @@ run_mmgbsa_for_iter() {
     --keep_tmp \
     --workers "$GBSA_WORKERS" \
     --charge_method "$GBSA_CHARGE_METHOD" \
+    --igb "$MMGBSA_IGB" \
+    --saltcon "$MMGBSA_SALTCON" \
+    "${extra[@]}" \
     2>&1 | tee -a "$LOGFILE"
 }
 
