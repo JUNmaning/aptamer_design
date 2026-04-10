@@ -9,6 +9,7 @@ Key improvements over original:
   - Robust fallback chain for charge detection
   - Better error diagnostics
   - Fix MOL2 residue name mismatch (MOL -> LIG)
+  - (NEW) Optional short GB minimization (sander) before MMPBSA to reduce clashes
 """
 
 from __future__ import annotations
@@ -338,23 +339,14 @@ def _inject_pose_coords_to_tpl(tpl_pdb: Path, pose_pdb: Path, out_pdb: Path) -> 
 
 
 def _fix_mol2_resname(mol2_path: Path, new_resname: str = "LIG") -> None:
-    """
-    Fix residue name in MOL2 file for tleap compatibility.
-    
-    Antechamber sometimes outputs 'MOL' or other residue names, but our
-    complex.pdb uses 'LIG', so we need to match them to avoid tleap errors.
-    
-    Args:
-        mol2_path: Path to the MOL2 file to fix
-        new_resname: New residue name (default: "LIG")
-    """
+    """Fix residue name in MOL2 for tleap compatibility."""
     if not mol2_path.exists():
         return
-    
+
     lines = mol2_path.read_text(errors="ignore").splitlines()
     out_lines: List[str] = []
     in_atom_section = False
-    
+
     for line in lines:
         if line.strip().startswith("@<TRIPOS>ATOM"):
             in_atom_section = True
@@ -364,7 +356,7 @@ def _fix_mol2_resname(mol2_path: Path, new_resname: str = "LIG") -> None:
             in_atom_section = False
             out_lines.append(line)
             continue
-        
+
         if in_atom_section:
             parts = line.split()
             if len(parts) >= 8:
@@ -378,9 +370,9 @@ def _fix_mol2_resname(mol2_path: Path, new_resname: str = "LIG") -> None:
                 except (ValueError, IndexError):
                     parts[7] = new_resname
                     line = " ".join(parts)
-        
+
         out_lines.append(line)
-    
+
     mol2_path.write_text("\n".join(out_lines) + "\n", errors="ignore")
 
 
@@ -528,9 +520,7 @@ def determine_ligand_charge(
 
 
 def _find_original_ligand_sdf(job: Dict, run_dir: Path) -> Optional[Path]:
-    """
-    Find the ORIGINAL ligand SDF file (with correct bond orders).
-    """
+    """Find the ORIGINAL ligand SDF file (with correct bond orders)."""
     for key in ["best_ligand_sdf", "ligand_sdf"]:
         val = (job.get(key) or "").strip()
         if val:
@@ -610,32 +600,50 @@ class MMGBSAConfig:
     ph: float = 7.4
     keep_tmp: bool = True
 
+    # (NEW) minimization options
+    minimize: bool = False
+    min_maxcyc: int = 1500
+    min_ncyc: int = 500
+    min_restraint: bool = False
+    min_restraint_wt: float = 2.0
+    min_restraint_mask: str = "!:LIG & !@H="
+
 
 def _write_tleap_in(work: Path, cfg: MMGBSAConfig) -> Path:
     leap_in = work / "tleap.in"
-    leap_in.write_text(
-        "\n".join([
-            f"source {cfg.leaprc_nucleic}",
-            f"source {cfg.leaprc_smallmol}",
+
+    lines = [
+        f"source {cfg.leaprc_nucleic}",
+        f"source {cfg.leaprc_smallmol}",
+        "",
+    ]
+
+    # If using GBn/GBn2, set radii to bondi to avoid sander radius errors
+    if int(cfg.igb) in (7, 8):
+        lines += [
+            "set default PBRadii bondi",
             "",
-            "LIG = loadMol2 ligand.mol2",
-            "loadamberparams ligand.frcmod",
-            "",
-            "REC = loadpdb receptor_amber.pdb",
-            "COM = loadpdb complex.pdb",
-            "",
-            "check REC",
-            "check LIG",
-            "check COM",
-            "",
-            "saveamberparm REC receptor.prmtop receptor.inpcrd",
-            "saveamberparm LIG ligand.prmtop ligand.inpcrd",
-            "saveamberparm COM complex.prmtop complex.inpcrd",
-            "quit",
-            "",
-        ]),
-        errors="ignore",
-    )
+        ]
+
+    lines += [
+        "LIG = loadMol2 ligand.mol2",
+        "loadamberparams ligand.frcmod",
+        "",
+        "REC = loadpdb receptor_amber.pdb",
+        "COM = loadpdb complex.pdb",
+        "",
+        "check REC",
+        "check LIG",
+        "check COM",
+        "",
+        "saveamberparm REC receptor.prmtop receptor.inpcrd",
+        "saveamberparm LIG ligand.prmtop ligand.inpcrd",
+        "saveamberparm COM complex.prmtop complex.inpcrd",
+        "quit",
+        "",
+    ]
+
+    leap_in.write_text("\n".join(lines), errors="ignore")
     return leap_in
 
 
@@ -646,6 +654,22 @@ def _write_cpptraj_in(work: Path) -> Path:
             "parm complex.prmtop",
             "trajin complex.inpcrd 1 1",
             "trajout complex.mdcrd",
+            "go",
+            "quit",
+            "",
+        ]),
+        errors="ignore",
+    )
+    return inp
+
+
+def _write_cpptraj_min_in(work: Path, inp_rst7: str = "complex_min.rst7", out_mdcrd: str = "complex_min.mdcrd") -> Path:
+    inp = work / "cpptraj_min.in"
+    inp.write_text(
+        "\n".join([
+            "parm complex.prmtop",
+            f"trajin {inp_rst7} 1 1",
+            f"trajout {out_mdcrd} mdcrd",
             "go",
             "quit",
             "",
@@ -673,6 +697,37 @@ def _write_mmpbsa_in(work: Path, cfg: MMGBSAConfig) -> Path:
     return inp
 
 
+def _write_min_in(work: Path, cfg: MMGBSAConfig) -> Path:
+    """
+    Write sander minimization input. Uses the SAME igb/saltcon as MMPBSA to be consistent.
+    """
+    lines = [
+        "Minimize complex (GB)",
+        "&cntrl",
+        "  imin=1,",
+        f"  maxcyc={int(cfg.min_maxcyc)},",
+        f"  ncyc={int(cfg.min_ncyc)},",
+        "  ntb=0,",
+        "  cut=999.0,",
+        f"  igb={int(cfg.igb)},",
+        f"  saltcon={float(cfg.saltcon):.3f},",
+        "  ntpr=100,",
+    ]
+    if cfg.min_restraint:
+        lines += [
+            "  ntr=1,",
+            f"  restraint_wt={float(cfg.min_restraint_wt):.3f},",
+            f"  restraintmask='{cfg.min_restraint_mask}',",
+        ]
+    else:
+        lines += ["  ntr=0,"]
+
+    lines += ["/", ""]
+    p = work / "min.in"
+    p.write_text("\n".join(lines), errors="ignore")
+    return p
+
+
 def _pick_job_paths(job: Dict) -> Tuple[Path, Path]:
     rec = job.get("best_receptor_pdb") or job.get("receptor_pdb") or ""
     pose = job.get("best_dock_pose_pdbqt") or job.get("pose_pdbqt") or ""
@@ -695,6 +750,8 @@ def run_one_mmgbsa(
     _require_exe("tleap")
     _require_exe("cpptraj")
     _require_exe("MMPBSA.py")
+    if cfg.minimize:
+        _require_exe("sander")
 
     receptor_pdb, pose_pdbqt = _pick_job_paths(job)
 
@@ -866,14 +923,47 @@ def run_one_mmgbsa(
             raise RuntimeError(f"tleap failed to generate {fn}. See {work / 'tleap.log'}")
 
     # -----------------------
-    # 8) cpptraj
+    # 8) cpptraj (original single-frame mdcrd)
     # -----------------------
     cpp_in = _write_cpptraj_in(work)
     _run_logged(["cpptraj", "-i", str(cpp_in)], cwd=work, log_path=work / "cpptraj.log")
 
     # -----------------------
-    # 9) MMPBSA
+    # 9) Optional minimization + MMPBSA
     # -----------------------
+    traj_for_mmpbsa = "complex.mdcrd"
+    final_name = "FINAL_RESULTS_MMPBSA.dat"
+
+    if cfg.minimize:
+        # sander minimization
+        min_in = _write_min_in(work, cfg)
+        _run_logged(
+            [
+                "sander", "-O",
+                "-i", str(min_in),
+                "-p", "complex.prmtop",
+                "-c", "complex.inpcrd",
+                "-ref", "complex.inpcrd",
+                "-r", "complex_min.rst7",
+                "-o", "complex_min.out",
+            ],
+            cwd=work, log_path=work / "sander_min.log",
+        )
+
+        # convert minimized restart to mdcrd
+        cpp_min = _write_cpptraj_min_in(work, inp_rst7="complex_min.rst7", out_mdcrd="complex_min.mdcrd")
+        _run_logged(
+            ["cpptraj", "-p", "complex.prmtop", "-i", str(cpp_min)],
+            cwd=work, log_path=work / "cpptraj_min.log"
+        )
+
+        if not (work / "complex_min.mdcrd").exists():
+            raise RuntimeError("Minimization enabled but complex_min.mdcrd not found. Check cpptraj_min.log")
+
+        traj_for_mmpbsa = "complex_min.mdcrd"
+        final_name = "FINAL_RESULTS_MMPBSA_MIN.dat"
+
+    # run MMPBSA
     mmp_in = _write_mmpbsa_in(work, cfg)
     _run_logged(
         [
@@ -882,12 +972,13 @@ def run_one_mmgbsa(
             "-cp", "complex.prmtop",
             "-rp", "receptor.prmtop",
             "-lp", "ligand.prmtop",
-            "-y", "complex.mdcrd",
+            "-y", traj_for_mmpbsa,
+            "-o", final_name,
         ],
         cwd=work, log_path=work / "mmpbsa.log",
     )
 
-    final_dat = work / "FINAL_RESULTS_MMPBSA.dat"
+    final_dat = work / final_name
     dg = _parse_mmpbsa_final_results(final_dat)
 
     rec = dict(job)
@@ -903,6 +994,14 @@ def run_one_mmgbsa(
         "mmgbsa_igb": int(cfg.igb),
         "mmgbsa_saltcon": float(cfg.saltcon),
         "mmgbsa_ph": float(cfg.ph),
+
+        # minimization metadata
+        "mmgbsa_minimized": bool(cfg.minimize),
+        "mmgbsa_min_maxcyc": int(cfg.min_maxcyc) if cfg.minimize else 0,
+        "mmgbsa_min_ncyc": int(cfg.min_ncyc) if cfg.minimize else 0,
+        "mmgbsa_min_restraint": bool(cfg.min_restraint) if cfg.minimize else False,
+        "mmgbsa_min_restraint_wt": float(cfg.min_restraint_wt) if cfg.minimize else 0.0,
+        "mmgbsa_min_restraint_mask": str(cfg.min_restraint_mask) if cfg.minimize else "",
     })
     if dg is None:
         rec["mmgbsa_ok"] = False
@@ -915,7 +1014,7 @@ def run_one_mmgbsa(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="MM/GBSA rescoring with automatic charge detection"
+        description="MM/GBSA rescoring with automatic charge detection (+ optional minimization)"
     )
     ap.add_argument("--run_dir", type=str, required=True)
     ap.add_argument("--iter", type=int, default=None)
@@ -933,6 +1032,18 @@ def main() -> None:
     ap.add_argument("--net_charge", type=int, default=None,
                     help="Override ligand net charge (auto-detect if not set)")
     ap.add_argument("--keep_tmp", action="store_true")
+
+    # (NEW) minimization flags
+    ap.add_argument("--minimize", action="store_true",
+                    help="Run a short GB minimization (sander) on the complex before MMPBSA")
+    ap.add_argument("--min_maxcyc", type=int, default=1500, help="sander maxcyc for minimization")
+    ap.add_argument("--min_ncyc", type=int, default=500, help="sander ncyc for minimization")
+    ap.add_argument("--min_restraint", action="store_true",
+                    help="Restrain receptor heavy atoms during minimization (recommended)")
+    ap.add_argument("--min_restraint_wt", type=float, default=2.0, help="Restraint weight (kcal/mol/A^2)")
+    ap.add_argument("--min_restraint_mask", type=str, default="!:LIG & !@H=",
+                    help="Amber mask for restrained atoms (default restrains non-ligand heavy atoms)")
+
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).expanduser().resolve()
@@ -958,6 +1069,10 @@ def main() -> None:
 
     if args.net_charge is not None:
         print(f"[mmgbsa] CLI override: --net_charge={args.net_charge}")
+
+    if args.minimize:
+        print(f"[mmgbsa] Minimization enabled: maxcyc={args.min_maxcyc} ncyc={args.min_ncyc} "
+              f"restraint={args.min_restraint} wt={args.min_restraint_wt} mask='{args.min_restraint_mask}'")
 
     if args.topN_csv is not None:
         topn_csv = Path(args.topN_csv).expanduser()
@@ -1003,6 +1118,13 @@ def main() -> None:
         charge_method=str(args.charge_method),
         no_gas_fallback=bool(args.no_gas_fallback),
         keep_tmp=bool(args.keep_tmp),
+
+        minimize=bool(args.minimize),
+        min_maxcyc=int(args.min_maxcyc),
+        min_ncyc=int(args.min_ncyc),
+        min_restraint=bool(args.min_restraint),
+        min_restraint_wt=float(args.min_restraint_wt),
+        min_restraint_mask=str(args.min_restraint_mask),
     )
 
     results: List[Dict] = []
@@ -1053,6 +1175,11 @@ def main() -> None:
         "mmgbsa_dg_bind", "mmgbsa_ok",
         "mmgbsa_charge", "mmgbsa_charge_source", "mmgbsa_charge_method",
         "mmgbsa_igb", "mmgbsa_saltcon", "mmgbsa_ph",
+
+        # minimization info
+        "mmgbsa_minimized", "mmgbsa_min_maxcyc", "mmgbsa_min_ncyc",
+        "mmgbsa_min_restraint", "mmgbsa_min_restraint_wt", "mmgbsa_min_restraint_mask",
+
         "receptor_pdb", "pose_pdbqt",
         "mmgbsa_workdir", "mmgbsa_final", "mmgbsa_log", "mmgbsa_error",
     ]
