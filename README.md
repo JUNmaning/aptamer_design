@@ -1,4 +1,3 @@
-```markdown
 # Aptamer Design Pipeline (CE + Multi-frame SimRNA + Vina Docking + MM/GBSA Feedback Loop + Optional GB Minimization + Optional MD)
 
 Author: maning
@@ -52,8 +51,6 @@ Given a ligand structure (SDF/PDB), the pipeline performs:
 ## 2) Key outputs (per run directory)
 
 A run directory (e.g. `runs/ce_run1/`) contains:
-
-```
 runs/<RUN_NAME>/
 ├── config_resolved.json
 ├── meta.json
@@ -90,8 +87,6 @@ runs/<RUN_NAME>/
 └── md/
     ├── rank_00x_<eval_hash>/
     └── md_summary.csv
-```
-
 ### File purpose summary
 
 | File | Purpose |
