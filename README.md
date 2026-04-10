@@ -15,18 +15,17 @@ The workflow is restartable/resumable and supports cheap smoke tests before expe
 ## Table of Contents
 
 1. [What this pipeline does](#1-what-this-pipeline-does)
-2. [Key outputs](#2-key-outputs-per-run-directory)
-3. [Environment and dependencies](#3-environment-and-dependencies)
-4. [Ligand charge handling (IMPORTANT)](#4-ligand-charge-handling-important)
-5. [How to run (production)](#5-how-to-run-production)
-6. [Quick Start (5-minute test)](#6-quick-start-5-minute-test)
-7. [Configuration explained](#7-configuration-explained)
-8. [Smoke test](#8-smoke-test)
-9. [How to analyze results](#9-how-to-analyze-results)
-10. [Common failure modes](#10-common-failure-modes)
-11. [Visualization](#11-visualization)
-12. [CE theory mapping](#12-ce-theory-mapping)
-13. [Reproducibility notes](#13-reproducibility-notes)
+2. [Environment setup (complete guide)](#2-environment-setup-complete-guide)
+3. [Ligand charge handling (IMPORTANT)](#3-ligand-charge-handling-important)
+4. [How to run (production)](#4-how-to-run-production)
+5. [Quick Start (5-minute test)](#5-quick-start-5-minute-test)
+6. [Configuration explained](#6-configuration-explained)
+7. [How to analyze results](#7-how-to-analyze-results)
+8. [Common failure modes](#8-common-failure-modes)
+9. [Visualization](#9-visualization)
+10. [Adapting to new molecules](#10-adapting-to-new-molecules)
+11. [CE theory mapping](#11-ce-theory-mapping)
+12. [Reproducibility notes](#12-reproducibility-notes)
 
 ---
 
@@ -48,69 +47,16 @@ Given a ligand structure (SDF/PDB), the pipeline performs:
 
 ---
 
-## 2) Key outputs (per run directory)
+## 2) Environment setup (complete guide)
 
-A run directory (e.g. `runs/ce_run1/`) contains:
+### 2.1 Install micromamba
 
-```
-runs/<RUN_NAME>/
-├── config_resolved.json
-├── meta.json
-├── logs/
-│   └── ce_design.log
-├── checkpoint.json
-├── dist.json
-├── history.csv
-├── topN.csv
-├── next_batch.txt
-├── ligand_ensemble/
-│   ├── manifest.json
-│   ├── charge.json
-│   ├── charge.txt
-│   └── conf_*.sdf
-├── fold/
-│   └── <eval_hash>/
-│       ├── aptamer.trafl
-│       ├── aptamer-000001_AA.pdb
-│       └── ...
-├── dock/
-│   └── <eval_hash>/
-│       └── frame_XXX/
-│           └── lig_YYY/
-│               ├── *.dock.pdbqt
-│               └── *.vina.log
-├── rescore/
-│   └── iter_XXX/
-│       ├── manifest.jsonl
-│       ├── mmgbsa_results.csv
-│       ├── results.csv
-│       ├── elites_for_ce.txt
-│       └── feedback.done
-└── md/
-    ├── rank_00x_<eval_hash>/
-    └── md_summary.csv
+```bash
+curl -L https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+mv bin/micromamba /usr/local/bin/
 ```
 
-### File purpose summary
-
-| File | Purpose |
-|------|---------|
-| `dist.json` | CE distribution state |
-| `checkpoint.json` | Resume state & stop_reason |
-| `history.csv` | Per-iteration metrics |
-| `topN.csv` | Best docking candidates |
-| `ligand_ensemble/manifest.json` | Charge detection info |
-| `rescore/iter_XXX/mmgbsa_results.csv` | Final rescoring results |
-| `rescore/iter_XXX/results.csv` | Feedback input |
-| `rescore/iter_XXX/feedback.done` | Completion marker |
-
----
-
-## 3) Environment and dependencies
-
-### 3.1 Recommended: mamba
-
-This project includes an `environment.yml`.
+### 2.2 Create conda environment
 
 ```bash
 micromamba create -f environment.yml -y
@@ -119,19 +65,68 @@ source ~/.bashrc
 micromamba activate aptamer_design
 ```
 
-### 3.2 External tools required
+### 2.3 Install bioinformatics tools
 
-The pipeline assumes these tools are available in PATH:
+```bash
+micromamba install -n aptamer_design -c bioconda -c conda-forge \
+  viennarna autodock-vina ambertools -y
+```
 
-- SimRNA (`SimRNA`, `SimRNA_trafl2pdbs`)
-- AutoDock Vina (`vina`)
-- AmberTools: `tleap`, `antechamber`, `parmchk2`, `cpptraj`, `pdb4amber`, `MMPBSA.py`
-- **(NEW: only if minimization enabled)** AmberTools `sander`
-- OpenBabel (`obabel`)
-- ViennaRNA (`RNAfold`)
-- Optional MD: GROMACS (`gmx`)
+Verify installation:
+```bash
+which RNAfold || echo "RNAfold not found"
+which vina || echo "Vina not found"
+which tleap || echo "tleap not found"
+which MMPBSA.py || echo "MMPBSA.py not found"
+which sander || echo "sander not found (only needed if minimization enabled)"
+```
 
-Quick check:
+### 2.4 Install SimRNA
+
+Download SimRNA package and extract to `/root/autodl-tmp`:
+
+```bash
+cd /root/autodl-tmp
+tar -xzf SimRNA_64bitIntel_Linux.tgz
+mv SimRNA_64bitIntel_Linux SimRNA
+```
+
+Set environment variables:
+
+```bash
+echo 'export SIMRNA_HOME=/root/autodl-tmp/SimRNA' >> ~/.bashrc
+echo 'export SIMRNA_CONFIG=/root/autodl-tmp/SimRNA/config.dat' >> ~/.bashrc
+echo 'export SIMRNA_DATA=/root/autodl-tmp/SimRNA/data' >> ~/.bashrc
+echo 'export PATH=$SIMRNA_HOME:$PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Make executables runnable:
+
+```bash
+chmod +x /root/autodl-tmp/SimRNA/SimRNA
+chmod +x /root/autodl-tmp/SimRNA/SimRNA_trafl2pdbs
+chmod +x /root/autodl-tmp/SimRNA/clustering
+chmod +x /root/autodl-tmp/SimRNA/calc_rmsd_to_1st_frame
+chmod +x /root/autodl-tmp/SimRNA/traflView
+```
+
+### 2.5 Update YAML configuration
+
+Edit your config file (e.g. `configs/run_default.yaml`) to point to SimRNA:
+
+```yaml
+eval:
+  simrna_config: /root/autodl-tmp/SimRNA/config.dat
+```
+
+### 2.6 Activate environment (for every new session)
+
+```bash
+micromamba activate aptamer_design
+```
+
+### 2.7 Verify all tools
 
 ```bash
 which RNAfold || echo "RNAfold not found"
@@ -144,15 +139,9 @@ which MMPBSA.py || echo "MMPBSA.py not found"
 which sander || echo "sander not found (only needed if minimization enabled)"
 ```
 
-### 3.3 Preflight check
-
-```bash
-bash scripts/preflight.sh
-```
-
 ---
 
-## 4) Ligand charge handling (IMPORTANT)
+## 3) Ligand charge handling (IMPORTANT)
 
 ### Why charge matters
 
@@ -175,6 +164,16 @@ The pipeline auto-detects ligand charge in this order:
 6. RDKit formal charge from ligand SDF
 7. PDBQT Gasteiger sum (last resort, unreliable)
 8. Fallback to 0 (with warning)
+
+### Common ligand charges at pH 7.4
+
+| Molecule type | Typical charge | Examples |
+|--------------|----------------|----------|
+| Phosphate compounds | -1 to -4 | ATP (-4), ADP (-3), phosphate ester (-1/-2) |
+| Carboxylic acids | -1 to -2 | Glutamate (-1), oxalate (-2) |
+| Sulfonic acids | -1 | PFHxS (-1), sulfonamide (-1) |
+| Neutral molecules | 0 | Caffeine, glucose |
+| Amines | +1 | Dopamine (+1), arginine (+1) |
 
 ### How to check your ligand charge
 
@@ -208,7 +207,7 @@ python -m experiments.rescore_mmgbsa \
 
 ---
 
-## 5) How to run (production)
+## 4) How to run (production)
 
 ### Standard workflow
 
@@ -264,9 +263,24 @@ rm -rf runs/ce_run1
 # then re-run from ligand prep
 ```
 
+### Stopping criteria (automatic)
+
+The loop stops when any of these conditions is met:
+
+1. `ce.iters` reached (e.g. 30 iterations)
+2. `monitor.early_stop` triggered (docking plateau)
+3. `monitor.collapse` triggered (distribution collapsed)
+4. External plateau detection (both GBSA and docking plateaus)
+
+Check which criterion stopped the run:
+
+```bash
+cat runs/ce_run1/checkpoint.json
+```
+
 ---
 
-## 6) Quick Start (5-minute test)
+## 5) Quick Start (5-minute test)
 
 ```bash
 cd ~/autodl-tmp/aptamer_design
@@ -294,6 +308,7 @@ ce:
   elite_frac: 0.5
 
 eval:
+  simrna_config: /root/autodl-tmp/SimRNA/config.dat
   simrna_iterations: 5000
   simrna_frames: "1"
   ligand_conformers: 2
@@ -312,119 +327,120 @@ head -n 5 runs/test/topN.csv
 
 ---
 
-## 7) Configuration explained
+## 6) Configuration explained
 
-### 7.1 `run`
+### 6.1 `run`
 - `run_dir`: output directory
 - `seed`: random seed
 - `workers`: parallel evaluation workers
 - `log_level`: INFO/DEBUG/...
-- `resume`: resume from checkpoint
 
-### 7.2 `inputs`
+### 6.2 `inputs`
 - `ligand`: ligand file path (SDF/PDB)
 
-### 7.3 `ce`
-- `length`, `alphabet`
-- `batch`, `iters`
-- `elite_frac`
-- `alpha`, `min_prob`, `temperature`
-- `topN`: export topN docking results for inspection
+### 6.3 `ce`
+- `length`: RNA sequence length
+- `alphabet`: RNA
+- `batch`: sequences sampled per iteration
+- `iters`: maximum iterations
+- `elite_frac`: fraction used as elites
+- `alpha`, `min_prob`, `temperature`: CE update parameters
+- `topN`: export top N for inspection
 
-### 7.4 `eval`
-- `simrna_config`, `omp_threads`, `simrna_iterations`
+### 6.4 `eval`
+- `simrna_config`: `/root/autodl-tmp/SimRNA/config.dat`
+- `omp_threads`: 1 (when workers > 1)
+- `simrna_iterations`: SimRNA sampling steps
 - `simrna_frames`: e.g. `"1"`, `"2-3"`
 - `decoy_agg`: `min`, `mean`, `p10`, `boltz`
 - `vina_exhaustiveness`, `vina_cpu`, `grid_padding`
-- ligand conformer knobs: `ligand_conformers`, `ligand_seed`, `ligand_prune_rmsd`, `ligand_forcefield`, `ligand_optimize`, `ligand_max_opt_iters`
+- Ligand conformer options: `ligand_conformers`, `ligand_seed`, `ligand_prune_rmsd`, `ligand_forcefield`, `ligand_optimize`
 
-### 7.5 `regularize`
+### 6.5 `regularize`
 - `entropy_uniform_mix`
 - `elite_min_hamming`
 - `struct_unique`, `struct_metric`, `struct_min_dist`
 
-### 7.6 `monitor`
-- `penalty_skip.*`
-- `early_stop.*`
-- `collapse.*`
-- `external_stop.*`
+### 6.6 `monitor`
+- `penalty_skip.*`: skip updates when too many failures
+- `early_stop.*`: stop on docking plateau
+- `collapse.*`: detect distribution collapse
+- `external_stop.*`: dual plateau detection
 
-### 7.7 `rescore` (MM/GBSA feedback)
+### 6.7 `rescore` (MM/GBSA feedback)
 
 Core keys:
-- `enabled`: enable MM/GBSA
-- `top_frac`: fraction of docking batch to rescore
-- `elite_frac`: fraction of rescored set used for feedback elites
-- `include_penalty`: whether penalty samples can be rescored
-- `gbsa_workers`: number of parallel MM/GBSA jobs
-- `gbsa_charge_method`: antechamber method: `bcc` or `gas`
+- `enabled`: true/false
+- `top_frac`: fraction of batch to rescore
+- `elite_frac`: fraction of rescored for feedback
+- `include_penalty`: allow penalty candidates
+- `gbsa_workers`: parallel MM/GBSA jobs
+- `gbsa_charge_method`: `bcc` or `gas`
 
-GB model keys:
-- `mmgbsa_igb`: GB model (commonly 5; GBn/GBn2 are 7/8)
+GB model:
+- `mmgbsa_igb`: 5 (standard), 7/8 (GBn/GBn2)
 - `mmgbsa_saltcon`: salt concentration (M)
 
 **NEW: Minimization before MMPBSA**
-- `mmgbsa_minimize`: true/false (enable `sander` minimization)
-- `mmgbsa_min_restraint`: true/false (recommended true)
-- `mmgbsa_min_maxcyc`: default 1500
-- `mmgbsa_min_ncyc`: default 500
-- `mmgbsa_min_restraint_wt`: default 2.0
-- `mmgbsa_min_restraint_mask`: recommended `"!:LIG & !@H="`
+- `mmgbsa_minimize`: true/false
+- `mmgbsa_min_restraint`: true (recommended)
+- `mmgbsa_min_maxcyc`: 1500
+- `mmgbsa_min_ncyc`: 500
+- `mmgbsa_min_restraint_wt`: 2.0
+- `mmgbsa_min_restraint_mask`: `"!:LIG & !@H="`
 
-Important YAML note: the mask contains `!`, so keep it quoted:
+Example configuration:
 
 ```yaml
-mmgbsa_min_restraint_mask: "!:LIG & !@H="
+rescore:
+  enabled: true
+  top_frac: 0.1
+  elite_frac: 0.5
+  gbsa_workers: 30
+  gbsa_charge_method: bcc
+  mmgbsa_igb: 5
+  mmgbsa_saltcon: 0.150
+  mmgbsa_minimize: true
+  mmgbsa_min_restraint: true
+  mmgbsa_min_maxcyc: 1500
+  mmgbsa_min_ncyc: 500
+  mmgbsa_min_restraint_wt: 2.0
+  mmgbsa_min_restraint_mask: "!:LIG & !@H="
 ```
 
-### 7.8 `md`
-- Optional MD configuration
+### 6.8 `md` (optional)
+- `enabled`: true/false
+- `topX`: number of sequences for MD
+- GROMACS parameters
 
 ---
 
-## 8) Smoke test
+## 7) How to analyze results
 
-Before expensive rescoring, do a cheap smoke test:
+### 7.1 Monitor progress
 
+Check iteration state:
 ```bash
-python -m experiments.ce_design --config configs/report_smoke.yaml 2>&1 | tee /tmp/report_smoke.log
+cat runs/ce_run1/checkpoint.json
 ```
 
-Validate multi-frame export:
-
+View history:
 ```bash
-RUN=runs/report_smoke
-HASH=$(ls "$RUN/fold" | head -n 1)
-
-python - <<PY
-from pathlib import Path
-p = Path("$RUN/fold/$HASH/aptamer.trafl")
-n = sum(1 for line in p.read_text(errors="ignore").splitlines() if len(line.split()) == 5)
-print("frames_in_trafl =", n)
-PY
-
-ls -lh "$RUN/fold/$HASH/"*_AA.pdb
-ls -1 "$RUN/dock/$HASH" | head -10
-head -n 5 "$RUN/topN.csv"
+tail -20 runs/ce_run1/history.csv
 ```
 
-Expected:
-- `frames_in_trafl >= 2`
-- at least two PDB files exported
-- docking folder includes multiple frames
-- `topN.csv` shows `n_frames >= 2`
+Real-time log:
+```bash
+tail -f runs/ce_run1/logs/ce_design.log
+```
 
----
-
-## 9) How to analyze results
-
-### 9.1 Docking results (`topN.csv`)
+### 7.2 Docking results
 
 ```bash
 head -n 10 runs/ce_run1/topN.csv
 ```
 
-### 9.2 MM/GBSA results (`rescore/iter_XXX/mmgbsa_results.csv`)
+### 7.3 MM/GBSA results
 
 ```bash
 python -c "
@@ -438,29 +454,18 @@ if n_ok > 0:
 "
 ```
 
-### 9.3 Check charge used in MM/GBSA
+### 7.4 Check charge and minimization
 
 ```bash
 python -c "
 import pandas as pd
 df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
-cols = [c for c in ['rank','mmgbsa_charge','mmgbsa_charge_source'] if c in df.columns]
+cols = [c for c in ['rank','mmgbsa_charge','mmgbsa_charge_source','mmgbsa_minimized'] if c in df.columns]
 print(df[cols].head(10).to_string(index=False))
 "
 ```
 
-### 9.4 Check whether minimization was used
-
-```bash
-python -c "
-import pandas as pd
-df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
-cols = [c for c in ['rank','mmgbsa_minimized','mmgbsa_min_maxcyc','mmgbsa_min_ncyc','mmgbsa_min_restraint'] if c in df.columns]
-print(df[cols].head(10).to_string(index=False))
-"
-```
-
-### 9.5 Manually re-run MM/GBSA with minimization
+### 7.5 Manually re-run MM/GBSA
 
 ```bash
 python -m experiments.rescore_mmgbsa \
@@ -480,9 +485,9 @@ python -m experiments.rescore_mmgbsa \
 
 ---
 
-## 10) Common failure modes
+## 8) Common failure modes
 
-### 10.1 All scores are `1e9` (penalty)
+### 8.1 All scores are `1e9` (penalty)
 
 Check:
 1. `topN.csv` error column
@@ -490,56 +495,146 @@ Check:
 3. whether `fold/<hash>/*_AA.pdb` exists
 4. whether `dock/<hash>/frame_*/lig_*/` contains `.vina.log`
 
-### 10.2 MM/GBSA all failed (`mmgbsa_ok=False`)
-
-Common causes:
+### 8.2 MM/GBSA all failed (`mmgbsa_ok=False`)
 
 **1) Wrong ligand charge:**
-
 ```bash
 cat runs/ce_run1/ligand_ensemble/charge.txt
 ```
 
 **2) Antechamber failed:**
-
 ```bash
 tail -50 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/antechamber.log
 ```
 
 **3) tleap failed:**
-
 ```bash
 tail -30 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/tleap.log
 ```
 
-**4) Minimization failed (only if enabled; requires `sander`):**
-
+**4) Minimization failed (only if enabled):**
 ```bash
 tail -80 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/sander_min.log
 ```
 
+**Diagnosis:**
+```bash
+python -c "
+import pandas as pd
+df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
+failed = df[df['mmgbsa_ok'].astype(str).str.lower() == 'false']
+print(f'Failed: {len(failed)}/{len(df)}')
+if len(failed) > 0:
+    cols = [c for c in ['rank','mmgbsa_error','mmgbsa_workdir'] if c in failed.columns]
+    print(failed[cols].head(3).to_string(index=False))
+"
+```
+
 ---
 
-## 11) Visualization
+## 9) Visualization
 
 ```bash
 python scripts/visualize_run.py --run_dir runs/ce_run1
 ```
 
+Output plots:
+- `plots/history_best_mean.png`
+- `plots/history_penalty.png`
+- `plots/mmgbsa_by_iter.png`
+- `plots/mmgbsa_vs_vina.png`
+
 ---
 
-## 12) CE theory mapping
+## 10) Adapting to new molecules
+
+### Quick adaptation (3 steps)
+
+**Step 1: Prepare new ligand file**
+```bash
+# Place your ligand in data/
+data/your_new_ligand.sdf
+```
+
+**Step 2: Determine charge**
+
+| Molecule type | Typical charge |
+|--------------|----------------|
+| Phosphate compounds | -1 to -4 |
+| Carboxylic acids | -1 to -2 |
+| Sulfonic acids | -1 |
+| Neutral molecules | 0 |
+| Amines | +1 |
+
+Check automatically:
+```bash
+python ligand/rdkit_conformers.py data/your_new_ligand.sdf --charge_only
+```
+
+**Step 3: Run with new parameters**
+```bash
+# Generate conformers
+python ligand/rdkit_conformers.py data/your_new_ligand.sdf \
+  --out_dir runs/my_new_run/ligand_ensemble \
+  --n_confs 10 \
+  --charge <YOUR_CHARGE>
+
+# Update config
+sed 's|data/PFHxS.sdf|data/your_new_ligand.sdf|' configs/run_default.yaml > configs/my_new_ligand.yaml
+sed -i 's|runs/ce_run3|runs/my_new_run|' configs/my_new_ligand.yaml
+
+# Run
+bash scripts/run_ce_gbsa_loop.sh configs/my_new_ligand.yaml
+```
+
+### Optional tuning
+
+**Large molecules:**
+```yaml
+eval:
+  grid_padding: 12.0  # default 8.0
+```
+
+**Flexible molecules:**
+```bash
+--n_confs 20  # increase conformers
+```
+
+**High charge molecules (e.g. ATP -4):**
+```yaml
+rescore:
+  mmgbsa_saltcon: 0.200  # increase salt
+```
+
+### Validated molecule types
+
+- Organic small molecules
+- Fluorinated compounds (PFHxS, PFOA)
+- Nucleotides (ATP, GTP)
+- Amino acids / peptides
+- Drug molecules
+- Metabolites
+
+### Not supported (require special handling)
+
+- Metal complexes (Fe³⁺, Zn²⁺)
+- Covalent binders
+- Very large molecules (>100 atoms)
+
+---
+
+## 11) CE theory mapping
 
 - A. Initialize distribution → `dist.json`
 - B. Sample batch → `ce.batch`
 - C. Evaluate samples → SimRNA + Vina + aggregation
-- D. Select elites → `elite_frac` + diversity constraints
-- E. Rescore topM → MM/GBSA via `rescore/iter_XXX/`
-- F. Update distribution → feedback updates `dist.json`
+- D. Select elites → `elite_frac` + diversity
+- E. Rescore topM → MM/GBSA
+- F. Update distribution → feedback
 
 ---
 
-## 13) Reproducibility notes
+## 12) Reproducibility notes
 
 To reproduce results:
 - Keep seed fixed and store `config_resolved.json`
@@ -551,6 +646,5 @@ Minimum debugging set:
 - `topN.csv` (first 5 lines + error column)
 - `logs/ce_design.log` (last 100 lines)
 - `ligand_ensemble/charge.txt`
-- one `fold/<hash>/` listing
-- one failing MM/GBSA workdir logs (`antechamber.log`, `tleap.log`, `mmpbsa.log`, and if enabled: `sander_min.log`)
+- One failing MM/GBSA workdir logs (`antechamber.log`, `tleap.log`, `mmpbsa.log`, and if enabled: `sander_min.log`)
 ```
