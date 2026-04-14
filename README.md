@@ -606,15 +606,6 @@ rescore:
   mmgbsa_saltcon: 0.200  # increase salt
 ```
 
-### Validated molecule types
-
-- Organic small molecules
-- Fluorinated compounds (PFHxS, PFOA)
-- Nucleotides (ATP, GTP)
-- Amino acids / peptides
-- Drug molecules
-- Metabolites
-
 ### Not supported (require special handling)
 
 - Metal complexes (Fe³⁺, Zn²⁺)
