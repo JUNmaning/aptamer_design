@@ -1,5 +1,5 @@
 run:
-  run_dir: runs/ce_run1
+  run_dir: runs/ce_run3
   seed: 123
   log_level: INFO
   workers: 30
@@ -10,21 +10,21 @@ inputs:
 ce:
   length: 30
   alphabet: RNA
-  batch: 500
-  iters: 50
+  batch: 1000
+  iters: 30
   elite_frac: 0.1
   alpha: 0.4
-  min_prob: 0.02
+  min_prob: 0.05
   temperature: 1.0
   topN: 50
 
 eval:
   simrna_config: /root/autodl-tmp/SimRNA/config.dat
   omp_threads: 1
-  simrna_iterations: 20000
-  simrna_frames: "1-3"
+  simrna_iterations: 8000
+  simrna_frames: "2-3"
   decoy_agg: "min"
-  vina_exhaustiveness: 8
+  vina_exhaustiveness: 6
   vina_cpu: 1
   grid_padding: 8.0
 
@@ -36,8 +36,8 @@ eval:
   ligand_max_opt_iters: 200
 
 regularize:
-  entropy_uniform_mix: 0.02
-  elite_min_hamming: 0.10
+  entropy_uniform_mix: 0.15
+  elite_min_hamming: 0.20
   struct_unique: false
   struct_metric: bp
   struct_min_dist: 0.0
@@ -50,8 +50,8 @@ monitor:
     reset_patience: 2
 
   early_stop:
-    enabled: true
-    patience: 4
+    enabled: false
+    patience: 6
     min_improve: 0.01
 
   collapse:
@@ -61,8 +61,10 @@ monitor:
     patience: 5
 
   external_stop:
-    gbsa_patience: 5
-    gbsa_min_improve: 0.1
+    gbsa_patience: 6
+    gbsa_min_improve: 0.01
+    dock_patience: 6
+    dock_min_improve: 0.01
 
 rescore:
   enabled: true
@@ -70,6 +72,15 @@ rescore:
   elite_frac: 0.5
   include_penalty: false
   gbsa_workers: 30
+  gbsa_charge_method: bcc
+  mmgbsa_igb: 5
+  mmgbsa_saltcon: 0.150
+  mmgbsa_minimize: true
+  mmgbsa_min_restraint: true
+  mmgbsa_min_maxcyc: 1500
+  mmgbsa_min_ncyc: 500
+  mmgbsa_min_restraint_wt: 2.0
+  mmgbsa_min_restraint_mask: "!:LIG & !@H="
 
 md:
   enabled: false
