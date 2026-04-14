@@ -1,3 +1,4 @@
+```markdown
 # Aptamer Design Pipeline (CE + Multi-frame SimRNA + Vina Docking + MM/GBSA Feedback Loop + Optional GB Minimization + Optional MD)
 
 Author: maning
@@ -53,14 +54,14 @@ Given a ligand structure (SDF/PDB), the pipeline performs:
 
 ```bash
 curl -L https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
-mv bin/micromamba /usr/local/bin/
+sudo mv bin/micromamba /usr/local/bin/
 ```
 
 ### 2.2 Create conda environment
 
 ```bash
 micromamba create -f environment.yml -y
-micromamba shell init -s bash -r /root/.local/share/mamba
+micromamba shell init -s bash
 source ~/.bashrc
 micromamba activate aptamer_design
 ```
@@ -83,41 +84,47 @@ which sander || echo "sander not found (only needed if minimization enabled)"
 
 ### 2.4 Install SimRNA
 
-Download SimRNA package and extract to `/root/autodl-tmp`:
+Download SimRNA from [official website](http://genesilico.pl/software/stand-alone/simrna) and extract:
 
 ```bash
-cd /root/autodl-tmp
+# Example installation to ~/tools/SimRNA
+mkdir -p ~/tools
+cd ~/tools
 tar -xzf SimRNA_64bitIntel_Linux.tgz
 mv SimRNA_64bitIntel_Linux SimRNA
 ```
 
-Set environment variables:
+Set environment variables (add to `~/.bashrc`):
 
 ```bash
-echo 'export SIMRNA_HOME=/root/autodl-tmp/SimRNA' >> ~/.bashrc
-echo 'export SIMRNA_CONFIG=/root/autodl-tmp/SimRNA/config.dat' >> ~/.bashrc
-echo 'export SIMRNA_DATA=/root/autodl-tmp/SimRNA/data' >> ~/.bashrc
-echo 'export PATH=$SIMRNA_HOME:$PATH' >> ~/.bashrc
+export SIMRNA_HOME=~/tools/SimRNA
+export SIMRNA_CONFIG=$SIMRNA_HOME/config.dat
+export SIMRNA_DATA=$SIMRNA_HOME/data
+export PATH=$SIMRNA_HOME:$PATH
+```
+
+Apply changes:
+```bash
 source ~/.bashrc
 ```
 
 Make executables runnable:
 
 ```bash
-chmod +x /root/autodl-tmp/SimRNA/SimRNA
-chmod +x /root/autodl-tmp/SimRNA/SimRNA_trafl2pdbs
-chmod +x /root/autodl-tmp/SimRNA/clustering
-chmod +x /root/autodl-tmp/SimRNA/calc_rmsd_to_1st_frame
-chmod +x /root/autodl-tmp/SimRNA/traflView
+chmod +x $SIMRNA_HOME/SimRNA
+chmod +x $SIMRNA_HOME/SimRNA_trafl2pdbs
+chmod +x $SIMRNA_HOME/clustering
+chmod +x $SIMRNA_HOME/calc_rmsd_to_1st_frame
+chmod +x $SIMRNA_HOME/traflView
 ```
 
 ### 2.5 Update YAML configuration
 
-Edit your config file (e.g. `configs/run_default.yaml`) to point to SimRNA:
+Edit your config file (e.g. `configs/run_default.yaml`) to point to your SimRNA installation:
 
 ```yaml
 eval:
-  simrna_config: /root/autodl-tmp/SimRNA/config.dat
+  simrna_config: ~/tools/SimRNA/config.dat  # or your installation path
 ```
 
 ### 2.6 Activate environment (for every new session)
@@ -186,21 +193,20 @@ python ligand/rdkit_conformers.py data/your_ligand.sdf --charge_only
 Prepare ligand conformers with the correct charge:
 
 ```bash
-cd ~/autodl-tmp/aptamer_design
-
 python ligand/rdkit_conformers.py data/PFHxS.sdf \
-  --out_dir runs/ce_run1/ligand_ensemble \
+  --out_dir runs/my_run/ligand_ensemble \
   --n_confs 10 \
   --charge -1
 
-cat runs/ce_run1/ligand_ensemble/charge.txt
+# Verify
+cat runs/my_run/ligand_ensemble/charge.txt
 ```
 
 ### Override charge during MM/GBSA only
 
 ```bash
 python -m experiments.rescore_mmgbsa \
-  --run_dir runs/ce_run1 \
+  --run_dir runs/my_run \
   --iter 1 \
   --net_charge -2
 ```
@@ -212,16 +218,14 @@ python -m experiments.rescore_mmgbsa \
 ### Standard workflow
 
 ```bash
-cd ~/autodl-tmp/aptamer_design
-
 # Step 1: Prepare ligand ensemble with correct charge
 python ligand/rdkit_conformers.py data/PFHxS.sdf \
-  --out_dir runs/ce_run1/ligand_ensemble \
+  --out_dir runs/my_run/ligand_ensemble \
   --n_confs 10 \
   --charge -1
 
 # Step 2: Verify charge
-cat runs/ce_run1/ligand_ensemble/charge.txt
+cat runs/my_run/ligand_ensemble/charge.txt
 
 # Step 3: Run CE + docking + MM/GBSA feedback loop
 bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
@@ -231,7 +235,7 @@ bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
 
 ```bash
 python ligand/rdkit_conformers.py data/PFHxS.sdf \
-  --out_dir runs/ce_run1/ligand_ensemble \
+  --out_dir runs/my_run/ligand_ensemble \
   --n_confs 10 \
   --charge -1 && \
 bash scripts/run_ce_gbsa_loop.sh configs/run_default.yaml
@@ -259,7 +263,7 @@ The loop will skip finished iterations (using `feedback.done`) and continue.
 ### Restart from scratch
 
 ```bash
-rm -rf runs/ce_run1
+rm -rf runs/my_run
 # then re-run from ligand prep
 ```
 
@@ -275,7 +279,7 @@ The loop stops when any of these conditions is met:
 Check which criterion stopped the run:
 
 ```bash
-cat runs/ce_run1/checkpoint.json
+cat runs/my_run/checkpoint.json
 ```
 
 ---
@@ -283,8 +287,6 @@ cat runs/ce_run1/checkpoint.json
 ## 5) Quick Start (5-minute test)
 
 ```bash
-cd ~/autodl-tmp/aptamer_design
-
 # 1) Prepare ligand
 python ligand/rdkit_conformers.py data/PFHxS.sdf \
   --out_dir runs/test/ligand_ensemble \
@@ -308,7 +310,7 @@ ce:
   elite_frac: 0.5
 
 eval:
-  simrna_config: /root/autodl-tmp/SimRNA/config.dat
+  simrna_config: ~/tools/SimRNA/config.dat  # adjust to your path
   simrna_iterations: 5000
   simrna_frames: "1"
   ligand_conformers: 2
@@ -348,7 +350,7 @@ head -n 5 runs/test/topN.csv
 - `topN`: export top N for inspection
 
 ### 6.4 `eval`
-- `simrna_config`: `/root/autodl-tmp/SimRNA/config.dat`
+- `simrna_config`: path to SimRNA config.dat (e.g. `~/tools/SimRNA/config.dat`)
 - `omp_threads`: 1 (when workers > 1)
 - `simrna_iterations`: SimRNA sampling steps
 - `simrna_frames`: e.g. `"1"`, `"2-3"`
@@ -421,23 +423,23 @@ rescore:
 
 Check iteration state:
 ```bash
-cat runs/ce_run1/checkpoint.json
+cat runs/my_run/checkpoint.json
 ```
 
 View history:
 ```bash
-tail -20 runs/ce_run1/history.csv
+tail -20 runs/my_run/history.csv
 ```
 
 Real-time log:
 ```bash
-tail -f runs/ce_run1/logs/ce_design.log
+tail -f runs/my_run/logs/ce_design.log
 ```
 
 ### 7.2 Docking results
 
 ```bash
-head -n 10 runs/ce_run1/topN.csv
+head -n 10 runs/my_run/topN.csv
 ```
 
 ### 7.3 MM/GBSA results
@@ -445,7 +447,7 @@ head -n 10 runs/ce_run1/topN.csv
 ```bash
 python -c "
 import pandas as pd
-df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
+df = pd.read_csv('runs/my_run/rescore/iter_001/mmgbsa_results.csv')
 n_ok = df['mmgbsa_ok'].astype(str).str.lower().isin(['true','1']).sum()
 print(f'MMGBSA success: {n_ok}/{len(df)}')
 if n_ok > 0:
@@ -459,7 +461,7 @@ if n_ok > 0:
 ```bash
 python -c "
 import pandas as pd
-df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
+df = pd.read_csv('runs/my_run/rescore/iter_001/mmgbsa_results.csv')
 cols = [c for c in ['rank','mmgbsa_charge','mmgbsa_charge_source','mmgbsa_minimized'] if c in df.columns]
 print(df[cols].head(10).to_string(index=False))
 "
@@ -469,7 +471,7 @@ print(df[cols].head(10).to_string(index=False))
 
 ```bash
 python -m experiments.rescore_mmgbsa \
-  --run_dir runs/ce_run1 \
+  --run_dir runs/my_run \
   --iter 1 \
   --topM 5 \
   --workers 1 \
@@ -499,29 +501,29 @@ Check:
 
 **1) Wrong ligand charge:**
 ```bash
-cat runs/ce_run1/ligand_ensemble/charge.txt
+cat runs/my_run/ligand_ensemble/charge.txt
 ```
 
 **2) Antechamber failed:**
 ```bash
-tail -50 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/antechamber.log
+tail -50 runs/my_run/rescore/iter_001/mmgbsa/rank_001_f*/antechamber.log
 ```
 
 **3) tleap failed:**
 ```bash
-tail -30 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/tleap.log
+tail -30 runs/my_run/rescore/iter_001/mmgbsa/rank_001_f*/tleap.log
 ```
 
 **4) Minimization failed (only if enabled):**
 ```bash
-tail -80 runs/ce_run1/rescore/iter_001/mmgbsa/rank_001_f*/sander_min.log
+tail -80 runs/my_run/rescore/iter_001/mmgbsa/rank_001_f*/sander_min.log
 ```
 
 **Diagnosis:**
 ```bash
 python -c "
 import pandas as pd
-df = pd.read_csv('runs/ce_run1/rescore/iter_001/mmgbsa_results.csv')
+df = pd.read_csv('runs/my_run/rescore/iter_001/mmgbsa_results.csv')
 failed = df[df['mmgbsa_ok'].astype(str).str.lower() == 'false']
 print(f'Failed: {len(failed)}/{len(df)}')
 if len(failed) > 0:
@@ -535,7 +537,7 @@ if len(failed) > 0:
 ## 9) Visualization
 
 ```bash
-python scripts/visualize_run.py --run_dir runs/ce_run1
+python scripts/visualize_run.py --run_dir runs/my_run
 ```
 
 Output plots:
@@ -581,7 +583,7 @@ python ligand/rdkit_conformers.py data/your_new_ligand.sdf \
 
 # Update config
 sed 's|data/PFHxS.sdf|data/your_new_ligand.sdf|' configs/run_default.yaml > configs/my_new_ligand.yaml
-sed -i 's|runs/ce_run3|runs/my_new_run|' configs/my_new_ligand.yaml
+sed -i 's|runs/my_run|runs/my_new_run|' configs/my_new_ligand.yaml
 
 # Run
 bash scripts/run_ce_gbsa_loop.sh configs/my_new_ligand.yaml
