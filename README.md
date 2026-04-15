@@ -484,6 +484,16 @@ python -m experiments.rescore_mmgbsa \
   --min_restraint_wt 2.0 \
   --min_restraint_mask '!:LIG & !@H='
 ```
+### 7.6 Extract the top scores of PBSA
+Extract global Top-50:
+```bash
+python scripts/extract_top_results.py --run_dir runs/ce_run1 --top_n 50
+```
+If you do not want repeated identical sequences in the Top-N:
+```bash
+python scripts/extract_top_results.py -r runs/ce_run3 -n 50 --unique_seq
+```
+This is often useful if your run has converged and the same sequence appears many times.
 
 ---
 
