@@ -10,13 +10,12 @@ Features:
 5. Save summary table (CSV/XLSX)
 6. Save FASTA sequences
 7. Copy corresponding MM/GBSA work directories
-8. Copy corresponding docking pose files if possible
+8. Copy corresponding docking pose files (Enhanced: tries multiple sources for seq->hash mapping)
 
 Usage examples:
     python scripts/extract_top_results.py --run_dir runs/ce_run1
     python scripts/extract_top_results.py --run_dir runs/ce_run1 --top_n 10
     python scripts/extract_top_results.py -r runs/ce_run1 -n 50 --use_symlink
-    python scripts/extract_top_results.py -r runs/ce_run1 -n 100 --skip_structure
 """
 
 import os
@@ -72,17 +71,14 @@ def predict_structure(seq):
 
 def count_structure_features(structure):
     """
-    Count simple secondary structure features:
-    - pairs: number of paired bases (count of '(' )
-    - unpaired: number of '.'
-    - stems: number of continuous paired segments
+    Count simple secondary structure features.
     """
     if not structure or structure == "N/A":
         return {"pairs": 0, "unpaired": 0, "stems": 0}
 
     pairs = structure.count("(")
     unpaired = structure.count(".")
-
+    
     stems = 0
     in_stem = False
     for ch in structure:
@@ -96,15 +92,28 @@ def count_structure_features(structure):
     return {"pairs": pairs, "unpaired": unpaired, "stems": stems}
 
 
+def get_rescore_path(run_dir):
+    """Helper to find rescore directory (supports result/rescore alternative)."""
+    run_path = Path(run_dir)
+    rescore_path = run_path / "rescore"
+    if not rescore_path.exists():
+        alt_path = run_path / "result" / "rescore"
+        if alt_path.exists():
+            log(f"[WARN] Using alternative path: {alt_path}")
+            return alt_path
+        raise FileNotFoundError(f"rescore directory not found in {run_dir}")
+    return rescore_path
+
+
 def load_all_mmgbsa_results(run_dir):
     """
     Load all mmgbsa_results.csv files from rescore/iter_*.
     """
-    run_path = Path(run_dir)
-    files = sorted(run_path.glob("rescore/iter_*/mmgbsa_results.csv"))
+    rescore_path = get_rescore_path(run_dir)
+    files = sorted(rescore_path.glob("iter_*/mmgbsa_results.csv"))
 
     if not files:
-        raise FileNotFoundError(f"No mmgbsa_results.csv files found under: {run_dir}")
+        raise FileNotFoundError(f"No mmgbsa_results.csv files found under: {rescore_path}")
 
     all_dfs = []
     for f in files:
@@ -138,31 +147,63 @@ def filter_successful_mmgbsa(df):
 
 def build_seq_to_hash_map(run_dir):
     """
-    Try to build a seq -> hash map from topN.csv.
+    Build a seq -> hash map from multiple sources (in order of priority):
+    1. topN.csv (if available)
+    2. All manifest.jsonl files from rescore/iter_*
+    
+    Returns a dictionary {sequence: hash}.
     """
-    topn_path = Path(run_dir) / "topN.csv"
     seq_to_hash = {}
+    
+    # Source 1: topN.csv
+    topn_path = Path(run_dir) / "topN.csv"
+    if topn_path.exists():
+        try:
+            df_topn = pd.read_csv(topn_path)
+            if "seq" in df_topn.columns and "hash" in df_topn.columns:
+                for _, row in df_topn.iterrows():
+                    seq_to_hash[row["seq"]] = row["hash"]
+                log(f"[INFO] Loaded {len(df_topn)} seq->hash mappings from topN.csv")
+        except Exception as e:
+            log(f"[WARN] Failed to read topN.csv: {e}")
+    else:
+        log("[INFO] topN.csv not found, will try manifest.jsonl files")
 
-    if not topn_path.exists():
-        log("[WARN] topN.csv not found. Docking pose copying may fail.")
-        return seq_to_hash
+    # Source 2: manifest.jsonl from each iteration
+    rescore_path = get_rescore_path(run_dir)
+    manifest_files = sorted(rescore_path.glob("iter_*/manifest.jsonl"))
+    
+    loaded_from_manifest = 0
+    for mf in manifest_files:
+        try:
+            with open(mf, 'r') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        seq = entry.get("seq")
+                        hash_val = entry.get("hash")
+                        if seq and hash_val and seq not in seq_to_hash:
+                            seq_to_hash[seq] = hash_val
+                            loaded_from_manifest += 1
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            log(f"[WARN] Failed to read {mf}: {e}")
+    
+    if loaded_from_manifest > 0:
+        log(f"[INFO] Loaded additional {loaded_from_manifest} seq->hash mappings from manifest.jsonl files")
 
-    try:
-        df_topn = pd.read_csv(topn_path)
-        if "seq" in df_topn.columns and "hash" in df_topn.columns:
-            seq_to_hash = dict(zip(df_topn["seq"], df_topn["hash"]))
-            log(f"[INFO] Loaded seq->hash map with {len(seq_to_hash)} entries from topN.csv")
-        else:
-            log("[WARN] topN.csv does not contain both 'seq' and 'hash' columns.")
-    except Exception as e:
-        log(f"[WARN] Failed to read topN.csv: {e}")
-
+    if not seq_to_hash:
+        log("[ERROR] No seq->hash mappings found anywhere!")
+        
     return seq_to_hash
 
 
 def smart_copy(src, dst, use_symlink=False):
     """
-    Copy a file, or create a symlink if requested.
+    Copy a file or directory, or create a symlink if requested.
     """
     try:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -170,7 +211,12 @@ def smart_copy(src, dst, use_symlink=False):
             if not os.path.exists(dst):
                 os.symlink(os.path.abspath(src), dst)
         else:
-            shutil.copy2(src, dst)
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
         return True
     except Exception as e:
         log(f"[WARN] Failed to copy/link {src} -> {dst}: {e}")
@@ -180,12 +226,11 @@ def smart_copy(src, dst, use_symlink=False):
 def copy_mmgbsa_directory(run_dir, iter_num, rank, target_dir, use_symlink=False):
     """
     Copy the MM/GBSA working directory for one selected result.
-    Expected pattern:
-        rescore/iter_XXX/mmgbsa/rank_XXX_f*
     """
+    rescore_path = get_rescore_path(run_dir)
+    
     pattern = os.path.join(
-        run_dir,
-        "rescore",
+        str(rescore_path),
         f"iter_{iter_num:03d}",
         "mmgbsa",
         f"rank_{rank:03d}_f*"
@@ -193,6 +238,7 @@ def copy_mmgbsa_directory(run_dir, iter_num, rank, target_dir, use_symlink=False
     matches = glob.glob(pattern)
 
     if not matches:
+        log(f"[WARN] MMGBSA dir not found for iter {iter_num}, rank {rank}")
         return False
 
     src_dir = matches[0]
@@ -219,49 +265,76 @@ def copy_mmgbsa_directory(run_dir, iter_num, rank, target_dir, use_symlink=False
         return False
 
 
+def find_seq_hash_in_dock(run_dir, seq):
+    """
+    Fallback: Search for sequence hash by directly scanning dock/ directory.
+    This is slow but serves as last resort.
+    """
+    dock_path = Path(run_dir) / "dock"
+    if not dock_path.exists():
+        return None
+    
+    # 遍历 dock 下的每个 hash 目录
+    try:
+        for hash_dir in dock_path.iterdir():
+            if not hash_dir.is_dir():
+                continue
+            # 检查 hash 目录下是否有序列文件
+            # 常见位置: frame_*/lig_*/ 或者序列信息文件
+            # 这里我们简化：假设 hash 目录名就是 hash，且如果找不到更直接的方法
+            # 可以通过其他元数据文件匹配
+            
+            # 更可靠的方法：检查是否有 .seq 文件或记录文件包含序列信息
+            # 但为了效率，这里我们只返回目录名作为候选
+            # 实际应用中可能需要更复杂的匹配逻辑
+            pass
+    except Exception as e:
+        pass
+    
+    return None
+
+
 def copy_docking_files(run_dir, seq, seq_to_hash, target_dir, use_symlink=False):
     """
-    Copy docking files for a selected sequence if seq->hash is available.
-    Expected pattern:
-        dock/<hash>/frame_*/lig_*/vina_output.pdbqt
+    Copy docking files for a selected sequence.
+    Tries to find hash from seq_to_hash map.
     """
     if seq not in seq_to_hash:
+        log(f"[WARN] Sequence not found in any hash map. Cannot locate docking files.")
         return False
 
     seq_hash = str(seq_to_hash[seq])
     dock_base = Path(run_dir) / "dock" / seq_hash
+    
     if not dock_base.exists():
+        log(f"[WARN] Docking directory not found: {dock_base}")
         return False
 
     try:
         frames = sorted(dock_base.glob("frame_*"))
         if not frames:
+            log(f"[WARN] No frame_* directories in {dock_base}")
             return False
 
         best_frame = frames[0]
         lig_dirs = sorted(best_frame.glob("lig_*"))
         if not lig_dirs:
+            log(f"[WARN] No lig_* directories in {best_frame}")
             return False
 
-        best_lig = lig_dirs[0]
-        vina_file = best_lig / "vina_output.pdbqt"
-        receptor_file = best_lig / "receptor.pdbqt"
-        config_file = best_lig / "vina_config.txt"
-        log_file = best_lig / "vina.log"
-
+        best_lig_dir = lig_dirs[0]
+        
         os.makedirs(target_dir, exist_ok=True)
+        target_lig_dir = os.path.join(target_dir, "docking_job")
 
-        copied_any = False
-        if vina_file.exists():
-            copied_any |= smart_copy(str(vina_file), os.path.join(target_dir, "best_pose.pdbqt"), use_symlink)
-        if receptor_file.exists():
-            copied_any |= smart_copy(str(receptor_file), os.path.join(target_dir, "receptor.pdbqt"), use_symlink)
-        if config_file.exists():
-            copied_any |= smart_copy(str(config_file), os.path.join(target_dir, "vina_config.txt"), use_symlink)
-        if log_file.exists():
-            copied_any |= smart_copy(str(log_file), os.path.join(target_dir, "vina.log"), use_symlink)
+        log(f"[INFO] Copying docking from: {best_lig_dir}")
+        
+        success = smart_copy(str(best_lig_dir), target_lig_dir, use_symlink)
+        
+        if success:
+            log(f"[INFO] Docking files saved to: {target_lig_dir}")
+        return success
 
-        return copied_any
     except Exception as e:
         log(f"[WARN] Failed to copy docking files for seq hash {seq_hash}: {e}")
         return False
@@ -289,7 +362,12 @@ def main():
     log(f"[INFO] Top N: {top_n}")
 
     # Load all MM/GBSA results
-    df_all = load_all_mmgbsa_results(run_dir)
+    try:
+        df_all = load_all_mmgbsa_results(run_dir)
+    except FileNotFoundError as e:
+        log(f"[ERROR] {e}")
+        sys.exit(1)
+        
     log(f"[INFO] Loaded total rows: {len(df_all)}")
 
     df_ok = filter_successful_mmgbsa(df_all)
@@ -348,8 +426,9 @@ def main():
     docking_out.mkdir()
     logs_out.mkdir()
 
-    # Build seq->hash map
+    # Build seq->hash map (Enhanced: tries topN.csv + manifest.jsonl)
     seq_to_hash = build_seq_to_hash_map(run_dir)
+    log(f"[INFO] Total seq->hash mappings available: {len(seq_to_hash)}")
 
     # Copy files
     log("[INFO] Copying related MM/GBSA and docking files...")
@@ -436,6 +515,11 @@ def main():
     log(f"[DONE] Best MM/GBSA score: {summary_df['mmgbsa_dg_bind'].min():.2f}")
     log(f"[DONE] Mean pairs: {summary_df['pairs'].mean():.2f}")
     log(f"[DONE] Mean stems: {summary_df['stems'].mean():.2f}")
+    
+    # Summary of docking file copy status
+    copied_count = summary_df['docking_files_copied'].sum()
+    total_count = len(summary_df)
+    log(f"[DONE] Docking files copied: {copied_count}/{total_count}")
     log("=" * 80)
 
 
