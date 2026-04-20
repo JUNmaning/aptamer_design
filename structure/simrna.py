@@ -65,7 +65,6 @@ def _ensure_data_symlink(workdir: Path) -> None:
         return
     data_dir = _guess_simrna_data_dir()
     if not data_dir:
-        # 不硬编码你的 /home/maning/tools/...，让错误信息明确
         raise FileNotFoundError(
             "Cannot locate SimRNA data directory. Set SIMRNA_HOME or SIMRNA_DATA, "
             "or ensure SimRNA_trafl2pdbs is installed alongside a 'data/' directory."
