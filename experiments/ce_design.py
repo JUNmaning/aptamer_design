@@ -1,3 +1,4 @@
+#ce.design.py
 from __future__ import annotations
 
 import argparse
@@ -886,12 +887,26 @@ def _gmx_supports(gmx: str, subcmd: str, flag: str) -> bool:
 
 
 def _entry_score(rec: Dict) -> float:
+    """
+    Priority:
+      1) MMGBSA (if ok)
+      2) docking score
+    """
+
+    if rec.get("mmgbsa_ok"):
+        try:
+            return float(rec.get("mmgbsa_dg_bind", 1e9))
+        except Exception:
+            pass
+
+    # fallback to docking
     for k in ("score", "agg_score", "dock_score", "vina_score", "best_score"):
         if k in rec and rec[k] is not None:
             try:
                 return float(rec[k])
             except Exception:
                 pass
+
     return float("inf")
 
 
