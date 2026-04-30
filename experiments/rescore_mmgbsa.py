@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#rescore_mmgbsa.py
 # -*- coding: utf-8 -*-
 """
 MM/GBSA rescoring for aptamer-ligand complexes.
@@ -15,6 +16,7 @@ Key improvements over original:
 from __future__ import annotations
 
 import argparse
+import pandas as pd
 import csv
 import json
 import re
@@ -1010,7 +1012,55 @@ def run_one_mmgbsa(
             else "missing_final_results"
         )
     return rec
+def write_mmgbsa_back_to_cache(run_dir: Path, rows: List[Dict]) -> None:
+    """
+    Merge MMGBSA results back into cache.jsonl
+    Priority: keep best (lowest dg_bind) if multiple entries
+    """
+    cache_path = run_dir / "cache.jsonl"
+    if not cache_path.exists():
+        print("[mmgbsa] cache.jsonl not found, skip write-back")
+        return
 
+    cache_rows = []
+    with cache_path.open("r", errors="ignore") as f:
+        for line in f:
+            if line.strip():
+                cache_rows.append(json.loads(line))
+
+    gbsa_map: Dict[str, Dict] = {}
+    for r in rows:
+        seq = r.get("seq")
+        if not seq:
+            continue
+        dg = float(r.get("mmgbsa_dg_bind", 1e9))
+        ok = bool(r.get("mmgbsa_ok", False))
+
+        if seq not in gbsa_map:
+            gbsa_map[seq] = r
+        else:
+            if dg < float(gbsa_map[seq].get("mmgbsa_dg_bind", 1e9)):
+                gbsa_map[seq] = r
+
+    for rec in cache_rows:
+        seq = rec.get("seq")
+        if seq in gbsa_map:
+            gb = gbsa_map[seq]
+            rec.update({
+                "mmgbsa_ok": bool(gb.get("mmgbsa_ok", False)),
+                "mmgbsa_dg_bind": float(gb.get("mmgbsa_dg_bind", 1e9)),
+                "mmgbsa_charge": gb.get("mmgbsa_charge"),
+                "mmgbsa_charge_source": gb.get("mmgbsa_charge_source"),
+                "mmgbsa_igb": gb.get("mmgbsa_igb"),
+                "mmgbsa_saltcon": gb.get("mmgbsa_saltcon"),
+                "mmgbsa_minimized": gb.get("mmgbsa_minimized", False),
+            })
+
+    with cache_path.open("w") as f:
+        for rec in cache_rows:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"[mmgbsa] ✅ results written back to {cache_path}")
 
 def main() -> None:
     ap = argparse.ArgumentParser(
@@ -1186,6 +1236,7 @@ def main() -> None:
 
     _write_jsonl(out_jsonl, merged)
     _write_csv(out_csv, merged, fields)
+    write_mmgbsa_back_to_cache(run_dir, merged)
 
     n_ok = sum(1 for r in merged if r.get("mmgbsa_ok"))
     n_fail = len(merged) - n_ok
