@@ -100,10 +100,6 @@ export SIMRNA_DATA=$SIMRNA_HOME/data
 export PATH=$SIMRNA_HOME:$PATH
 ```
 
-Apply changes:
-```bash
-source ~/.bashrc
-```
 
 Make executables runnable:
 
@@ -113,6 +109,10 @@ chmod +x $SIMRNA_HOME/SimRNA_trafl2pdbs
 chmod +x $SIMRNA_HOME/clustering
 chmod +x $SIMRNA_HOME/calc_rmsd_to_1st_frame
 chmod +x $SIMRNA_HOME/traflView
+```
+Apply changes:
+```bash
+source ~/.bashrc
 ```
 
 ### 2.5 Update YAML configuration
