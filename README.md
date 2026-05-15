@@ -1,7 +1,4 @@
-```markdown
-# Aptamer Design Pipeline (CE + Multi-frame SimRNA + Vina Docking + MM/GBSA Feedback Loop + Optional GB Minimization + Optional MD)
-
-Author: maning
+### Aptamer Design Pipeline (CE + Multi-frame SimRNA + Vina Docking + MM/GBSA Feedback Loop + Optional GB Minimization + Optional MD)
 
 This repository implements an end-to-end, reproducible RNA aptamer design pipeline driven by a Cross-Entropy (CE) optimizer.
 
