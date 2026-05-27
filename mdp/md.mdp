@@ -1,7 +1,7 @@
 title = RNA aptamer MD (screening)
 ; Run parameters
 integrator  = md        ; leap-frog integrator
-nsteps               = 2500000          ; 5 ns (2 fs timestep)
+nsteps = 50000000         ; 5 ns (2 fs timestep)
 dt          = 0.002     ; 2 fs
 ; Output control
 nstxout             = 0         ; suppress .trr output 
