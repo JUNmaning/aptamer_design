@@ -668,8 +668,8 @@ python -m experiments.complex_md_amber \
 # Enter the corresponding rank directory
 cd runs/ce_run3/complex_md_amber/rank_001/
 
-# View the last few lines of the log file in real-time and search for lines containing 'Remaining'
-watch -n 10 "grep -A 2 'Remaining' md.log | tail -n 5"
+# View the currently running step
+tail -f md.log
 ```
 **Automated Workflow:**
 
