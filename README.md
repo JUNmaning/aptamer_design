@@ -664,6 +664,7 @@ python -m experiments.complex_md_amber \
     --mdp_dir mdp \
     --threads 16 \
     --gpu
+# If you want to view the estimated running time, please open a new terminal
 # Enter the corresponding rank directory
 cd runs/ce_run3/complex_md_amber/rank_001/
 
