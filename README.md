@@ -647,4 +647,40 @@ Minimum debugging set:
 - `logs/ce_design.log` (last 100 lines)
 - `ligand_ensemble/charge.txt`
 - One failing MM/GBSA workdir logs (`antechamber.log`, `tleap.log`, `mmpbsa.log`, and if enabled: `sander_min.log`)
+
+---
+
+## 13) Post-Design: Aptamer-Target Complex MD Analysis
+After identifying top candidates via MM/GBSA rescoring, you can perform full-atom Molecular Dynamics (MD) simulations on the Aptamer-Ligand complex to evaluate binding stability, conformational changes, and hydrogen bond persistence.
+The pipeline uses complex_md_amber.py, which automates the Amber-to-GROMACS topology conversion and running the MD production.
+
+** How to run**
+```bash
+# Example: Run MD for Top 3 candidates using 16 threads and GPU
+python -m experiments.complex_md_amber \
+    --run_dir runs/ce_run3 \
+    --top 3 \
+    --mdp_dir mdp \
+    --threads 16 \
+    --gpu
+```
+
+** Automated Workflow **
+1.Ligand Parameterization: Converts docking PDBQT to SDF, then to Mol2 using Antechamber (BCC charges, GAFF2).
+2.Topology Assembly: Combines RNA (Amber OL3) and Ligand into a unified Amber topology via tleap.
+3.GROMACS Conversion: Uses ParmEd to generate .top and .gro files with injected TIP3P water and ion definitions.
+4.MD Protocol:
+- Energy Minimization (Steepest Descent)
+- NVT Equilibration (Temperature coupling)
+- NPT Equilibration (Pressure coupling)
+- Production MD (Length determined by your md.mdp)
+Analysis: Automatically calculates RMSD and RMSF.
+** Key Outputs **
+Each candidate gets a folder runs/run_name/complex_md_amber/rank_00x/:
+
+- md.xtc: The simulation trajectory.
+- rmsd.xvg: Root-mean-square deviation (stability check).
+- rmsf.xvg: Root-mean-square fluctuation (flexibility check).
+- complex.top & complex.gro: The starting topology and structure.
+
 ```
