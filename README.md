@@ -67,7 +67,7 @@ micromamba activate aptamer_design
 
 ```bash
 micromamba install -n aptamer_design -c bioconda -c conda-forge \
-  viennarna autodock-vina ambertools -y
+  viennarna autodock-vina ambertools acpype -y
 ```
 
 Verify installation:
