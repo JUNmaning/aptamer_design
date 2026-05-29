@@ -657,10 +657,10 @@ The pipeline uses complex_md_amber.py, which automates the Amber-to-GROMACS topo
 **How to run:**
 
 ```bash
-# Example: Run MD for Top 3 candidates using 16 threads and GPU
+# Example: Run MD for Top 1 candidates using 16 threads and GPU
 python -m experiments.complex_md_amber \
     --run_dir runs/ce_run3 \
-    --top 3 \
+    --top 1 \
     --mdp_dir mdp \
     --threads 16 \
     --gpu
