@@ -690,3 +690,9 @@ Each candidate gets a folder runs/run_name/complex_md_amber/rank_00x/:
 - rmsd.xvg: Root-mean-square deviation (stability check).
 - rmsf.xvg: Root-mean-square fluctuation (flexibility check).
 - complex.top & complex.gro: The starting topology and structure.
+
+---
+
+## 14) Multi-Ligand Redocking + MM/GBSA（No Folding）
+
+
