@@ -139,6 +139,7 @@ def main():
     print("\n===== FINAL RANKING (by MMGBSA) =====")
     cols = [c for c in ["ligand_sdf", "pose_pdbqt", "score_vina", "mmgbsa_dg_bind"] if c in df_mm.columns]
     print(df_mm[cols])
+    print("\nSaved to:", final_csv)
 
 
 if __name__ == "__main__":
