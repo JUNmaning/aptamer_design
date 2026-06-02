@@ -136,8 +136,9 @@ def main():
     df_out = df_out.sort_values("vina_affinity")
     df_out.to_csv(out_root / "summary.csv", index=False)
 
-    print("\n===== FINAL RANKING =====")
-    print(df_out)
+    print("\n===== FINAL RANKING (by MMGBSA) =====")
+    cols = [c for c in ["ligand_sdf", "pose_pdbqt", "score_vina", "mmgbsa_dg_bind"] if c in df_mm.columns]
+    print(df_mm[cols])
 
 
 if __name__ == "__main__":
