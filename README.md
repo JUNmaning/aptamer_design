@@ -708,6 +708,7 @@ python -m scripts.redock_and_mmgbsa_batch \
     --ligands data/ligand1.sdf data/ligand2.sdf.sdf data/ligand3.sdf.sdf \
     --exhaustiveness 16 \
     --aptamer_topN 3 \
+    --cpu 12 \
     --workers 16 \
     --minimize
 ```
