@@ -698,7 +698,7 @@ Utility script:
 ```
 scripts/redock_and_mmgbsa_batch.py
 ```
-Allows redocking multiple ligands against the best aptamer structure from a completed CE run, Select final_desult/summary_top50.csv，followed by automatic MM/GBSA rescoring.
+Allows redocking multiple ligands against the best aptamer structure from a completed CE run, after 7.6 Extract the top scores of PBSA，select final_desult/summary_top50.csv，followed by automatic MM/GBSA rescoring.
 
 No refolding is performed (uses best_receptor_pdb).
 **Usage:**
