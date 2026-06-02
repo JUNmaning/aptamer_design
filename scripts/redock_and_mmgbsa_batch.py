@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Redock multiple ligands against the BEST GBSA aptamer
+Redock multiple ligands against TOP-N GBSA aptamers
 (from final_result/summary_top50.csv)
 + run MMGBSA automatically
 """
@@ -26,6 +26,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_dir", required=True)
     parser.add_argument("--ligands", nargs="+", required=True)
+    parser.add_argument("--aptamer_topN", type=int, default=1,
+                        help="Use top-N GBSA aptamers (default=1)")
     parser.add_argument("--exhaustiveness", type=int, default=8)
     parser.add_argument("--padding", type=float, default=8.0)
     parser.add_argument("--cpu", type=int, default=1)
@@ -36,104 +38,93 @@ def main():
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
-
     summary_file = run_dir / "final_result" / "summary_top50.csv"
-    if not summary_file.exists():
-        raise FileNotFoundError(f"Not found: {summary_file}")
 
     df = pd.read_csv(summary_file)
+    df_sorted = df.sort_values("mmgbsa_dg_bind").reset_index(drop=True)
 
-    if "mmgbsa_dg_bind" not in df.columns:
-        raise RuntimeError("summary_top50.csv missing mmgbsa_dg_bind column")
+    topN = min(args.aptamer_topN, len(df_sorted))
+    selected_aptamers = df_sorted.iloc[:topN]
 
-    best = df.sort_values("mmgbsa_dg_bind").iloc[0]
+    print(f"\nUsing top {topN} GBSA aptamers\n")
 
-    receptor_pdb = Path(best["best_receptor_pdb"]).resolve()
-    best_seq = best["seq"]
+    all_results = []
 
-    print("Using GBSA-best receptor:", receptor_pdb)
-    print("Best sequence:", best_seq)
-    print("Best GBSA:", best["mmgbsa_dg_bind"])
+    for apt_idx, apt in selected_aptamers.iterrows():
+        receptor_pdb = Path(apt["best_receptor_pdb"]).resolve()
+        apt_seq = apt["seq"]
+        apt_rank = apt_idx + 1
 
-    out_root = run_dir / "redock_mmgbsa_batch"
-    out_root.mkdir(exist_ok=True)
+        print(f"\n==============================")
+        print(f"Aptamer rank {apt_rank}")
+        print(f"GBSA = {apt['mmgbsa_dg_bind']}")
+        print("==============================")
 
-    docking_rows = []
+        docking_rows = []
 
-    # =========================
-    #  Dock
-    # =========================
-    for idx, lig in enumerate(args.ligands, start=1):
-        lig = Path(lig).resolve()
-        lig_name = lig.stem
+        for lig in args.ligands:
+            lig = Path(lig).resolve()
+            lig_name = lig.stem
 
-        print(f"\n=== Docking {lig_name} ===")
+            print(f"\nDocking {lig_name} vs aptamer {apt_rank}")
 
-        workdir = out_root / lig_name
+            workdir = run_dir / "redock_mmgbsa_batch" / f"aptamer_{apt_rank}" / lig_name
 
-        res = dock_one(
-            name=lig_name,
-            receptor_pdb=receptor_pdb,
-            ligand_sdf=lig,
-            workdir=workdir,
-            padding_angstrom=args.padding,
-            exhaustiveness=args.exhaustiveness,
-            cpu=args.cpu,
-        )
+            res = dock_one(
+                name=f"{lig_name}_apt{apt_rank}",
+                receptor_pdb=receptor_pdb,
+                ligand_sdf=lig,
+                workdir=workdir,
+                padding_angstrom=args.padding,
+                exhaustiveness=args.exhaustiveness,
+                cpu=args.cpu,
+            )
 
-        docking_rows.append({
-            "seq": best_seq,
-            "rank": idx,
-            "best_frame": 1,
-            "score_vina": res.affinity_kcal,
-            "receptor_pdb": str(receptor_pdb),
-            "pose_pdbqt": str(res.out_pdbqt),
-            "ligand_sdf": str(lig),
-        })
+            docking_rows.append({
+                "seq": apt_seq,
+                "rank": apt_rank,
+                "best_frame": 1,
+                "score_vina": res.affinity_kcal,
+                "receptor_pdb": str(receptor_pdb),
+                "pose_pdbqt": str(res.out_pdbqt),
+                "ligand_sdf": str(lig),
+            })
 
-        print("Affinity:", res.affinity_kcal)
+        dock_csv = run_dir / "redock_mmgbsa_batch" / f"aptamer_{apt_rank}_dock.csv"
+        pd.DataFrame(docking_rows).to_csv(dock_csv, index=False)
 
-    dock_csv = out_root / "redock_topN.csv"
-    pd.DataFrame(docking_rows).to_csv(dock_csv, index=False)
+        cmd = [
+            "python",
+            "-m",
+            "experiments.rescore_mmgbsa",
+            "--run_dir", str(run_dir),
+            "--topN_csv", str(dock_csv),
+            "--iter_out", f"99{apt_rank}",
+            "--workers", str(args.workers),
+            "--igb", str(args.igb),
+            "--saltcon", str(args.saltcon),
+        ]
 
-    print("\nDocking summary written to:", dock_csv)
+        if args.minimize:
+            cmd += ["--minimize", "--min_restraint"]
 
-    # =========================
-    #  Run MMGBSA
-    # =========================
-    print("\n=== Running MMGBSA ===")
+        run_cmd(cmd)
 
-    cmd = [
-        "python",
-        "-m",
-        "experiments.rescore_mmgbsa",
-        "--run_dir", str(run_dir),
-        "--topN_csv", str(dock_csv),
-        "--iter_out", "999",
-        "--workers", str(args.workers),
-        "--igb", str(args.igb),
-        "--saltcon", str(args.saltcon),
-    ]
+        mmgbsa_csv = run_dir / "rescore" / f"iter_99{apt_rank}" / "mmgbsa_results.csv"
+        df_mm = pd.read_csv(mmgbsa_csv)
 
-    if args.minimize:
-        cmd += ["--minimize", "--min_restraint"]
+        df_mm["aptamer_rank"] = apt_rank
+        all_results.append(df_mm)
 
-    run_cmd(cmd)
+    final_df = pd.concat(all_results)
+    final_df = final_df.sort_values("mmgbsa_dg_bind")
 
-    mmgbsa_csv = run_dir / "rescore" / "iter_999" / "mmgbsa_results.csv"
-    if not mmgbsa_csv.exists():
-        print("MMGBSA results not found.")
-        return
+    out_file = run_dir / "redock_mmgbsa_batch" / "final_matrix.csv"
+    final_df.to_csv(out_file, index=False)
 
-    df_mm = pd.read_csv(mmgbsa_csv)
-    df_mm = df_mm.sort_values("mmgbsa_dg_bind")
-
-    final_csv = out_root / "final_ranking.csv"
-    df_mm.to_csv(final_csv, index=False)
-
-    print("\n===== FINAL RANKING =====")
-    print(df_mm[["score_vina", "mmgbsa_dg_bind"]])
-    print("\nSaved to:", final_csv)
+    print("\n===== FINAL MATRIX (sorted by ΔG) =====")
+    print(final_df[["aptamer_rank", "ligand_sdf", "mmgbsa_dg_bind"]])
+    print("\nSaved to:", out_file)
 
 
 if __name__ == "__main__":
