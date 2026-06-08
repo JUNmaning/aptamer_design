@@ -687,9 +687,9 @@ Analysis: Automatically calculates RMSD and RMSF.
 Each candidate gets a folder runs/run_name/complex_md_amber/rank_00x/:
 
 - md.xtc: The simulation trajectory.
-- rmsd.xvg: Root-mean-square deviation (stability check).
-- rmsf.xvg: Root-mean-square fluctuation (flexibility check).
 - complex.top & complex.gro: The starting topology and structure.
+
+It is recommended to manually complete the RMSD and RMSF analysis in the future. Running the xvg files provided for RMSD and RMSF may result in selecting the wrong group.
 
 ---
 
