@@ -184,9 +184,7 @@ def run_md_steps(workdir: Path, gmx: str, mdp_dir: Path, threads: int, gpu: bool
 
 def run_analysis(workdir: Path, gmx: str):
     print("[INFO] Running Analysis (RMSD/RMSF)...")
-    # 自动识别 index
     run_cmd([gmx, "make_ndx", "-f", "md.tpr", "-o", "index.ndx"], cwd=workdir, input_text="q\n")
-    # RMSD (通常 Group 1 是 RNA，Group 13 是小分子)
     run_cmd([gmx, "rms", "-s", "md.tpr", "-f", "md.xtc", "-o", "rmsd.xvg", "-tu", "ns"], 
             cwd=workdir, input_text="1\n1\n")
     run_cmd([gmx, "rmsf", "-s", "md.tpr", "-f", "md.xtc", "-o", "rmsf.xvg", "-res"], 
