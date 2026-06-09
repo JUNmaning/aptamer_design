@@ -53,19 +53,29 @@ def build_ligand_files(workdir: Path, pose_pdbqt: Path):
 def prepare_complex(run_dir: Path, rec: dict, workdir: Path):
     receptor_path = Path(rec["best_receptor_pdb"])
     if not receptor_path.is_absolute(): receptor_path = (run_dir / receptor_path).resolve()
+    
     ligand_fixed_pdb = workdir / "ligand_fixed.pdb"
     complex_raw = workdir / "complex_raw.pdb"
+    
     with complex_raw.open("w") as out:
-        out.write(receptor_path.read_text())
-        out.write("\nTER\n")
+        for line in receptor_path.read_text().splitlines():
+            if line.startswith(("ATOM", "HETATM", "TER")):
+                out.write(line + "\n")
+        
+        out.write("TER\n")
+
         for line in ligand_fixed_pdb.read_text().splitlines():
-            if line.startswith(("ATOM", "HETATM")): out.write(line + "\n")
-        out.write("TER\nEND\n")
+            if line.startswith(("ATOM", "HETATM")):
+                out.write(line + "\n")
+
+        out.write("END\n")
+    
     complex_sanitized = workdir / "complex_sanitized.pdb"
     sanitize_rna_pdb(complex_raw, complex_sanitized)
     return complex_sanitized
 
 def build_amber_system(workdir: Path):
+
     tleap_script = """
 source leaprc.RNA.OL3
 source leaprc.gaff2
@@ -79,6 +89,7 @@ quit
     run_cmd(["tleap", "-f", "tleap.in"], cwd=workdir)
 
 def convert_to_gromacs(workdir: Path):
+
     import parmed as pmd
     amber = pmd.load_file(str(workdir / "complex.prmtop"), str(workdir / "complex.inpcrd"))
     top_path = workdir / "complex.top"
@@ -142,9 +153,8 @@ CL               1
     top_path.write_text("\n".join(new_lines) + "\n")
 
 def run_md_steps(workdir: Path, gmx: str, mdp_dir: Path, threads: int, gpu: bool):
+    """GROMACS"""
     md_env = {"OMP_NUM_THREADS": str(threads)}
-    
-    # 基础参数：强制 MPI 任务数为 1
     mdrun_base = [gmx, "mdrun", "-ntomp", str(threads), "-ntmpi", "1"]
 
     run_cmd([gmx, "editconf", "-f", "complex.gro", "-o", "boxed.gro", "-c", "-d", "1.0", "-bt", "cubic"], cwd=workdir)
@@ -154,21 +164,14 @@ def run_md_steps(workdir: Path, gmx: str, mdp_dir: Path, threads: int, gpu: bool
     run_cmd([gmx, "genion", "-s", "ions.tpr", "-o", "solv_ions.gro", "-p", "complex.top", "-pname", "NA", "-nname", "CL", "-neutral"], 
             cwd=workdir, input_text="SOL\n")
 
-    # --- EM (能量最小化) ---
-    # 关键：EM 不支持 PME GPU 加速，所以如果开启了 GPU，只给 -nb gpu
     shutil.copy2(mdp_dir / "em.mdp", workdir / "em.mdp")
     run_cmd([gmx, "grompp", "-f", "em.mdp", "-c", "solv_ions.gro", "-p", "complex.top", "-o", "em.tpr", "-maxwarn", "2"], cwd=workdir)
-    
-    em_mdrun = list(mdrun_base)
-    if gpu: 
-        em_mdrun += ["-nb", "gpu"] # 仅加速非键相互作用
-    run_cmd(em_mdrun + ["-deffnm", "em"], cwd=workdir, env=md_env)
+    em_cmd = list(mdrun_base)
+    if gpu: em_cmd += ["-nb", "gpu"]
+    run_cmd(em_cmd + ["-deffnm", "em"], cwd=workdir, env=md_env)
 
-    # --- 动态步骤 (NVT, NPT, MD) ---
-    # 这些步骤支持 PME GPU 加速
-    dyn_mdrun = list(mdrun_base)
-    if gpu:
-        dyn_mdrun += ["-nb", "gpu", "-pme", "gpu"]
+    dyn_cmd = list(mdrun_base)
+    if gpu: dyn_cmd += ["-nb", "gpu", "-pme", "gpu"]
 
     for step in ["nvt", "npt", "md"]:
         shutil.copy2(mdp_dir / f"{step}.mdp", workdir / f"{step}.mdp")
@@ -177,10 +180,13 @@ def run_md_steps(workdir: Path, gmx: str, mdp_dir: Path, threads: int, gpu: bool
         if step != "nvt": args += ["-t", f"{prev}.cpt"]
         if step in ["nvt", "npt"]: args += ["-r", f"{prev}.gro"]
         run_cmd(args, cwd=workdir)
-        run_cmd(dyn_mdrun + ["-deffnm", step], cwd=workdir, env=md_env)
+        run_cmd(dyn_cmd + ["-deffnm", step], cwd=workdir, env=md_env)
 
 def run_analysis(workdir: Path, gmx: str):
     print("[INFO] Running Analysis (RMSD/RMSF)...")
+    # 自动识别 index
+    run_cmd([gmx, "make_ndx", "-f", "md.tpr", "-o", "index.ndx"], cwd=workdir, input_text="q\n")
+    # RMSD (通常 Group 1 是 RNA，Group 13 是小分子)
     run_cmd([gmx, "rms", "-s", "md.tpr", "-f", "md.xtc", "-o", "rmsd.xvg", "-tu", "ns"], 
             cwd=workdir, input_text="1\n1\n")
     run_cmd([gmx, "rmsf", "-s", "md.tpr", "-f", "md.xtc", "-o", "rmsf.xvg", "-res"], 
@@ -227,7 +233,7 @@ def main():
             convert_to_gromacs(workdir)
             run_md_steps(workdir, args.gmx, mdp_dir, args.threads, args.gpu)
             run_analysis(workdir, args.gmx)
-            print(f"\n✅ Rank {rank} Finished! Results in {workdir}")
+            print(f"\n✅ Rank {rank} Success!")
         except Exception as e:
             print(f"\n❌ Rank {rank} failed: {e}")
             continue
