@@ -1,6 +1,6 @@
 ### Aptamer Design Pipeline (CE + Multi-frame SimRNA + Vina Docking + MM/GBSA Feedback Loop + GB Minimization + Optional MD)
 
-This repository implements an end-to-end, reproducible RNA aptamer design pipeline driven by a Cross-Entropy (CE) optimizer.
+This repository implements an end-to-end, reproducible aptamer design pipeline driven by a Cross-Entropy (CE) optimizer.
 
 At each CE iteration, the pipeline samples RNA sequences from a probability distribution, evaluates them via RNA structure sampling (SimRNA) and docking (AutoDock Vina) using multiple RNA decoy frames and multiple ligand conformers, then runs MM/GBSA rescoring on top candidates and feeds those scores back to update the CE distribution for the next iteration.
 
@@ -32,9 +32,9 @@ The workflow is restartable/resumable and supports cheap smoke tests before expe
 Given a ligand structure (SDF/PDB), the pipeline performs:
 
 1. Ligand ensemble generation (RDKit conformers with charge validation)
-2. RNA structure sampling (ViennaRNA + SimRNA trajectory)
+2. structure sampling (ViennaRNA + SimRNA trajectory)
 3. Multi-frame decoy export (SimRNA `.trafl` to multiple all-atom PDBs)
-4. Docking (Vina) across RNA frames × ligand conformers
+4. Docking (Vina) across frames × ligand conformers
 5. Aggregation across frames/conformers (e.g. min)
 6. CE update using docking elites
 7. MM/GBSA rescoring for top candidates
